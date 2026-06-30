@@ -320,11 +320,18 @@ def addChildrenHistory(elementObj, objs, historyValues):
 	if len(objs["tags"]):
 		for row in historyValues:
 			rowValues = {}
+			allNull = True
 			for tag in objs["tags"]:
 				tagPath = tagPathGen2ToGen1(tag)
 				tagName = getTagNameFromPath(tagPath)
 				rowValues[tagName] = row[tag]
-			elementObj["values"].append({"value":rowValues, "quality":"Good", "timestamp":formatUtc(row["t_stamp"])})
+				if row[tag] is not None:
+					allNull = False
+			# historyValues carries the union of every tag's timestamps across the
+			# whole object tree; skip rows where none of THIS object's own tags
+			# have a point (they'd be all-null VQTs from a sibling's timestamp).
+			if not allNull:
+				elementObj["values"].append({"value":rowValues, "quality":"Good", "timestamp":formatUtc(row["t_stamp"])})
 
 	if len(objs["objects"]):
 		elementObj["isComposition"] = True
