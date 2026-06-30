@@ -34,8 +34,15 @@ def _respond(request, jsonStr):
 			gz = GZIPOutputStream(baos)
 			gz.write(String(jsonStr).getBytes("UTF-8"))
 			gz.close()
-			request["servletResponse"].setHeader("Content-Encoding", "gzip")
-			return {'response': baos.toByteArray(), 'contentType': 'application/json'}
+			# Returning a byte[] under 'response' makes WebDev base64-encode it,
+			# so write the raw gzip bytes straight to the servlet stream instead.
+			resp = request["servletResponse"]
+			resp.setHeader("Content-Encoding", "gzip")
+			resp.setContentType("application/json")
+			out = resp.getOutputStream()
+			out.write(baos.toByteArray())
+			out.flush()
+			return None
 	except:
 		system.util.getLogger("i3x").warn("gzip encoding failed; sending uncompressed response")
 
