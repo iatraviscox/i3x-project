@@ -329,166 +329,187 @@ def getObjectTypes(namespaceUri=None, elementIds=None):
 	ret = [obj for obj in allTypes.values() if namespaceUri == None or obj["namespaceUri"] == namespaceUri]
 	return (200, False, None, ret)
 
-def getObjects(typeId=None, includeMetadata=False, root=None, elementIds=None, callType="list", relationshipType=None, maxDepth=1, startTime=None, endTime=None):
-	# Backs every Object endpoint, dispatched by callType:
-	#   list    - GET /objects and POST /objects/list
-	#   related - POST /objects/related
-	#   value   - POST /objects/value      (live values, recursed to maxDepth)
-	#   history - POST /objects/history    (historian values, recursed to maxDepth)
-	# A None elementIds means the non-bulk GET /objects listing; otherwise this is
-	# a bulk request keyed by elementId.
-	log = system.util.getLogger("i3x.objects")
+def _indexByElementId(udtInstances):
+	# Map elementId -> instance for direct lookups instead of scanning.
+	idx = {}
+	for path in udtInstances:
+		idx[udtInstances[path]["elementId"]] = udtInstances[path]
+	return idx
 
+def _resolveObject(elementId, byElementId):
+	# The addressable object for elementId, or None when unknown or when it is an
+	# intermediate folder nested under a UDT (not an object in its own right).
+	udtInstance = byElementId.get(elementId, None)
+	if udtInstance is None or (udtInstance["type"] == "folder" and udtInstance["parentUdt"] != None):
+		return None
+	return udtInstance
+
+def _bulkPerObject(elementIds, fn):
+	# Shared driver for the bulk object endpoints: resolve each requested id and
+	# apply fn(elementId, udtInstance, udtInstances) to build its result, wrapping
+	# it in a bulk item. Unknown/unaddressable ids become per-item 404s.
+	udtInstances = i3x.ignition.getUdtInstances()
+	byElementId = _indexByElementId(udtInstances)
+	ret = []
 	bulkError = False
+	for elementId in elementIds:
+		udtInstance = _resolveObject(elementId, byElementId)
+		if udtInstance is None:
+			bulkError = True
+			ret.append(bulkErr(404, "Element not found: %s" % elementId, elementId=elementId))
+		else:
+			ret.append(bulkOk(fn(elementId, udtInstance, udtInstances), elementId=elementId))
+	return (200, bulkError, None, ret)
 
-	# Parse the history time range once, up front - not inside the per-element
-	# loop (re-parsing an already-parsed Date would throw on the 2nd element).
-	startDate = None
-	endDate = None
-	if callType == "history":
-		if startTime == None or endTime == None:
-			return (400, False, "startTime and endTime are required (RFC 3339)", None)
+def _currentValue(udtInstance, udtInstances, maxDepth):
+	# CurrentValueResult for one object: an alarm's status object, or a UDT's live
+	# value with composition children recursed under "components" up to maxDepth.
+	# Folders and providers have no value, so report GoodNoData.
+	if udtInstance["typeId"] == "ignition-alarm":
+		alarmObj = udtInstance["alarmObj"]
+		return {"value":alarmObj, "quality":"Good", "timestamp":alarmObj["eventTime"], "isComposition":False}
+
+	# value/quality/timestamp are required by CurrentValueResult.
+	elementObj = {"value":None, "quality":"GoodNoData", "timestamp":i3x.utils.formatUtc(system.date.now()), "isComposition":udtInstance["isComposition"]}
+	if udtInstance["typeId"] != "folder-type" and udtInstance["typeId"] != "ignition-tag-provider":
+		childrenValues = {}
+		quality = None
+		timestamp = None
+		value = system.tag.readBlocking([udtInstance["path"]])[0]
+		value = i3x.ignition.getTagValue(udtInstance, value)
+		if value != None:
+			elementObj.update(value["value"])
+			childrenValues = value["childrenValues"]
+			quality = value["value"]["quality"]
+			timestamp = value["value"]["timestamp"]
+		i3x.utils.addChildrenValues(udtInstances, udtInstance, elementObj, childrenValues, quality, timestamp, 2, maxDepth)
+	return elementObj
+
+def _queryHistory(tags, startDate, endDate):
+	# Query the historian for a set of tag paths over [startDate, endDate] and
+	# return change-only rows (consecutive-identical and all-null rows dropped).
+	#
+	# NOTE: sampling is heuristic - one LastValue bucket per minute with PREV
+	# fill. It bounds the result size and de-duplicates, but loses sub-minute
+	# detail. This is the single place to change history resolution (e.g. use
+	# returnSize=-1 for natural/raw points).
+	minutes = system.date.minutesBetween(startDate, endDate)
+	res = system.historian.queryAggregatedPoints(paths=tags, startTime=startDate, endTime=endDate, aggregates=["LastValue"] * len(tags), fillModes=["PREV"] * len(tags), returnFormat="WIDE", returnSize=max(1, minutes), includeBounds=True)
+	cols = res.getColumnNames()
+	historyValues = []
+	prevValues = None
+	for row in res:
+		timestamp = row[0]
+		rowValues = {}
+		allNull = True
+		for i in range(1, len(cols)):
+			rowValues[cols[i]] = row[i]
+			if row[i] != None:
+				allNull = False
+
+		# Keep only rows that changed and aren't entirely null.
+		if rowValues != prevValues and not allNull:
+			prevValues = dict(rowValues)
+			rowValues["t_stamp"] = timestamp
+			historyValues.append(rowValues)
+	return historyValues
+
+def _historyValue(udtInstance, maxDepth, startDate, endDate, log):
+	# HistoricalValueResult for one object: alarm-journal events for an alarm, or
+	# historian values for a UDT's tags (recursed to maxDepth under "components").
+	elementObj = {"values":[], "isComposition":udtInstance["isComposition"]}
+	udtInstancePath = udtInstance["path"]
+
+	if udtInstance["typeId"] == "ignition-alarm":
+		# Alarm history needs an alarm journal profile. If none is configured (or
+		# the query fails), return empty history rather than failing with a 500.
 		try:
-			startDate = i3x.utils.parseUtc(startTime)
-			endDate = i3x.utils.parseUtc(endTime)
+			res = system.alarm.queryJournal(startDate, endDate, journalName=i3x.ignition.ALARM_JOURNAL, source=udtInstancePath)
+			for row in res:
+				alarmObj = i3x.ignition.getAlarmObj(row)
+				elementObj["values"].append({"value":alarmObj, "quality":"Good", "timestamp":alarmObj["eventTime"], "isComposition":False})
 		except:
-			return (400, False, "startTime and endTime must be RFC 3339 timestamps", None)
+			log.warn("Alarm journal query failed for %s; returning empty history" % udtInstance["elementId"])
+	elif udtInstance["typeId"] != "folder-type" and udtInstance["typeId"] != "ignition-tag-provider":
+		# Collect the historizable leaf tags (recursing to maxDepth), query the
+		# historian for all of them at once, then shape into the response.
+		tagConfig = system.tag.getConfiguration(udtInstancePath, True)
+		if len(tagConfig) and "tags" in tagConfig[0]:
+			objs = {"tags":[], "objects":{}}
+			tags = i3x.utils.getTags(udtInstancePath, objs, tagConfig[0]["tags"], 1, maxDepth)
+			if len(tags):
+				historyValues = _queryHistory(tags, startDate, endDate)
+				i3x.utils.addChildrenHistory(elementObj, objs, historyValues)
+	return elementObj
 
+def _listObjects(typeId, includeMetadata, root):
+	# GET /objects: list every addressable object, optionally filtered by type id
+	# or restricted to roots. Intermediate folders nested under a UDT are skipped.
 	if typeId != None:
 		typeId = i3x.utils.elementIdToPath(typeId)
-
 	udtInstances = i3x.ignition.getUdtInstances()
-
-	isBulk = elementIds != None
 	ret = []
+	for udtInstancePath in udtInstances:
+		udtInstance = udtInstances[udtInstancePath]
+		if typeId != None and typeId != udtInstance["typeId"]:
+			continue
+		if udtInstance["type"] == "folder" and udtInstance["parentUdt"] != None:
+			continue
+		if root and udtInstance["parentId"] != None:
+			continue
+		ret.append(i3x.utils.buildUdtInstanceObj(udtInstance, includeMetadata))
+	return (200, False, None, ret)
 
-	if not isBulk:
-		# GET /objects: list every addressable object, optionally filtered by type
-		# or restricted to roots. Intermediate folders nested under a UDT are not
-		# objects in their own right and are skipped.
-		for udtInstancePath in udtInstances:
-			udtInstance = udtInstances[udtInstancePath]
-			dtTypeId = udtInstance["typeId"]
+def _listObjectsByIds(elementIds, includeMetadata):
+	# POST /objects/list: the object record for each requested elementId.
+	return _bulkPerObject(elementIds, lambda elementId, udtInstance, udtInstances: i3x.utils.buildUdtInstanceObj(udtInstance, includeMetadata))
 
-			if typeId == None or typeId == dtTypeId:
-				if udtInstance["type"] == "folder" and udtInstance["parentUdt"] != None:
-					continue
+def _relatedObjects(elementIds, relationshipType, includeMetadata):
+	# POST /objects/related: objects reachable from each requested object across
+	# every edge type (optionally filtered by relationshipType).
+	edgeTypes = ("HasParent", "AlarmOf", "ComponentOf", "HasChildren", "HasComponent", "HasAlarm")
+	def related(elementId, udtInstance, udtInstances):
+		retObj = []
+		for edge in edgeTypes:
+			retObj.extend(i3x.utils.getRelatedObjects(relationshipType, edge, udtInstance, udtInstances, includeMetadata))
+		return retObj
+	return _bulkPerObject(elementIds, related)
 
-				if root and udtInstance["parentId"] != None:
-					continue
+def _objectValues(elementIds, maxDepth):
+	# POST /objects/value: current value for each requested object.
+	return _bulkPerObject(elementIds, lambda elementId, udtInstance, udtInstances: _currentValue(udtInstance, udtInstances, maxDepth))
 
-				ret.append(i3x.utils.buildUdtInstanceObj(udtInstance, includeMetadata))
-	else:
-		# Bulk: index instances by elementId so each requested id is a direct
-		# lookup instead of a full scan of every instance per id.
-		byElementId = {}
-		for path in udtInstances:
-			byElementId[udtInstances[path]["elementId"]] = udtInstances[path]
+def _objectHistory(elementIds, maxDepth, startTime, endTime):
+	# POST /objects/history: historical values for each requested object over the
+	# RFC 3339 range [startTime, endTime] (both required, validated up front).
+	if startTime == None or endTime == None:
+		return (400, False, "startTime and endTime are required (RFC 3339)", None)
+	try:
+		startDate = i3x.utils.parseUtc(startTime)
+		endDate = i3x.utils.parseUtc(endTime)
+	except:
+		return (400, False, "startTime and endTime must be RFC 3339 timestamps", None)
 
-		for elementId in elementIds:
-			udtInstance = byElementId.get(elementId, None)
+	log = system.util.getLogger("i3x.objects")
+	return _bulkPerObject(elementIds, lambda elementId, udtInstance, udtInstances: _historyValue(udtInstance, maxDepth, startDate, endDate, log))
 
-			# Intermediate folders nested under a UDT aren't addressable objects;
-			# treat them (and unknown ids) as not found.
-			if udtInstance is None or (udtInstance["type"] == "folder" and udtInstance["parentUdt"] != None):
-				bulkError = True
-				ret.append(bulkErr(404, "Element not found: %s" % elementId, elementId=elementId))
-				continue
-
-			udtInstancePath = udtInstance["path"]
-			obj = i3x.utils.buildUdtInstanceObj(udtInstance, includeMetadata)
-
-			if callType == "related":
-				# Return the objects reachable from this one across every edge type
-				# (optionally filtered by relationshipType inside getRelatedObjects).
-				retObj = []
-				retObj.extend(i3x.utils.getRelatedObjects(relationshipType, "HasParent", udtInstance, udtInstances, includeMetadata))
-				retObj.extend(i3x.utils.getRelatedObjects(relationshipType, "AlarmOf", udtInstance, udtInstances, includeMetadata))
-				retObj.extend(i3x.utils.getRelatedObjects(relationshipType, "ComponentOf", udtInstance, udtInstances, includeMetadata))
-				retObj.extend(i3x.utils.getRelatedObjects(relationshipType, "HasChildren", udtInstance, udtInstances, includeMetadata))
-				retObj.extend(i3x.utils.getRelatedObjects(relationshipType, "HasComponent", udtInstance, udtInstances, includeMetadata))
-				retObj.extend(i3x.utils.getRelatedObjects(relationshipType, "HasAlarm", udtInstance, udtInstances, includeMetadata))
-
-				ret.append(bulkOk(retObj, elementId=elementId))
-			elif callType == "value":
-				# value/quality/timestamp are required by CurrentValueResult;
-				# folders and providers have no value, so default to GoodNoData.
-				elementObj = {"value":None, "quality":"GoodNoData", "timestamp":i3x.utils.formatUtc(system.date.now()), "isComposition":udtInstance["isComposition"]}
-				childrenValues = {}
-				quality = None
-				timestamp = None
-
-				if udtInstance["typeId"] == "ignition-alarm":
-					# An alarm's "value" is its current alarm status object.
-					alarmObj = udtInstance["alarmObj"]
-					quality = "Good"
-					timestamp = alarmObj["eventTime"]
-					elementObj = {"value":udtInstance["alarmObj"], "quality":quality, "timestamp":timestamp, "isComposition":False}
-				elif udtInstance["typeId"] != "folder-type" and udtInstance["typeId"] != "ignition-tag-provider":
-					# Read the live UDT value, then recurse into composition children
-					# up to maxDepth, attaching them under "components".
-					value = system.tag.readBlocking([udtInstancePath])[0]
-					value = i3x.ignition.getTagValue(udtInstance, value)
-					if value != None:
-						elementObj.update(value["value"])
-						childrenValues = value["childrenValues"]
-						quality = value["value"]["quality"]
-						timestamp = value["value"]["timestamp"]
-
-					i3x.utils.addChildrenValues(udtInstances, udtInstance, elementObj, childrenValues, quality, timestamp, 2, maxDepth)
-
-				ret.append(bulkOk(elementObj, elementId=elementId))
-			elif callType == "history":
-				elementObj = {"values":[], "isComposition":udtInstance["isComposition"]}
-
-				if udtInstance["typeId"] == "ignition-alarm":
-					# Alarm history needs an alarm journal profile. If none is
-					# configured (or the query fails), return empty history
-					# rather than failing the whole request with a 500.
-					try:
-						res = system.alarm.queryJournal(startDate, endDate, journalName=i3x.ignition.ALARM_JOURNAL, source=udtInstancePath)
-						for row in res:
-							alarmObj = i3x.ignition.getAlarmObj(row)
-							elementObj["values"].append({"value":alarmObj, "quality":"Good", "timestamp":alarmObj["eventTime"], "isComposition":False})
-					except:
-						log.warn("Alarm journal query failed for %s; returning empty history" % elementId)
-				elif udtInstance["typeId"] != "folder-type" and udtInstance["typeId"] != "ignition-tag-provider":
-					# Collect the historizable leaf tags (recursing to maxDepth),
-					# query the historian for all of them at once, then de-duplicate
-					# consecutive identical rows before shaping the response.
-					tagConfig = system.tag.getConfiguration(udtInstancePath, True)
-					if len(tagConfig) and "tags" in tagConfig[0]:
-						objs = {"tags":[], "objects":{}}
-						tags = i3x.utils.getTags(udtInstancePath, objs, tagConfig[0]["tags"], 1, maxDepth)
-						if len(tags):
-							minutes = system.date.minutesBetween(startDate, endDate)
-							res = system.historian.queryAggregatedPoints(paths=tags, startTime=startDate, endTime=endDate, aggregates=["LastValue"] * len(tags), fillModes=["PREV"] * len(tags), returnFormat="WIDE", returnSize=max(1, minutes), includeBounds=True)
-							cols = res.getColumnNames()
-							historyValues = []
-							prevValues = None
-							for row in res:
-								timestamp = row[0]
-								rowValues = {}
-								allNull = True
-								for i in range(1, len(cols)):
-									rowValues[cols[i]] = row[i]
-									if row[i] != None:
-										allNull = False
-
-								# Keep only rows that changed and aren't entirely null.
-								if rowValues != prevValues and not allNull:
-									prevValues = dict(rowValues)
-									rowValues["t_stamp"] = timestamp
-									historyValues.append(rowValues)
-
-							i3x.utils.addChildrenHistory(elementObj, objs, historyValues)
-
-				ret.append(bulkOk(elementObj, elementId=elementId))
-			else:
-				# callType == "list": just the object record.
-				ret.append(bulkOk(obj, elementId=elementId))
-
-	return (200, bulkError, None, ret)
+def getObjects(typeId=None, includeMetadata=False, root=None, elementIds=None, callType="list", relationshipType=None, maxDepth=1, startTime=None, endTime=None):
+	# Entry point for every Object endpoint; dispatches to a focused helper.
+	# elementIds is None for the non-bulk GET /objects listing; otherwise this is
+	# a bulk request keyed by elementId and callType selects the operation:
+	#   list    - POST /objects/list
+	#   related - POST /objects/related
+	#   value   - POST /objects/value
+	#   history - POST /objects/history
+	if elementIds is None:
+		return _listObjects(typeId, includeMetadata, root)
+	if callType == "related":
+		return _relatedObjects(elementIds, relationshipType, includeMetadata)
+	if callType == "value":
+		return _objectValues(elementIds, maxDepth)
+	if callType == "history":
+		return _objectHistory(elementIds, maxDepth, startTime, endTime)
+	return _listObjectsByIds(elementIds, includeMetadata)
 
 def _subscribeItem(subscription, elementId, maxDepth, udtInstances):
 	# Expand to the element plus its composition descendants (per maxDepth) and
