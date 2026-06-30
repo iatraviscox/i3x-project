@@ -394,10 +394,16 @@ def getObjects(typeId=None, includeMetadata=False, root=None, elementIds=None, c
 						elementObj = {"values":[], "isComposition":udtInstance["isComposition"]}
 
 						if udtInstance["typeId"] == "ignition-alarm":
-							res = system.alarm.queryJournal(startDate, endDate, journalName="Journal", source=udtInstancePath)
-							for row in res:
-								alarmObj = i3x.ignition.getAlarmObj(row)
-								elementObj["values"].append({"value":alarmObj, "quality":"Good", "timestamp":alarmObj["eventTime"], "isComposition":False})
+							# Alarm history needs an alarm journal profile. If none is
+							# configured (or the query fails), return empty history
+							# rather than failing the whole request with a 500.
+							try:
+								res = system.alarm.queryJournal(startDate, endDate, journalName=i3x.ignition.ALARM_JOURNAL, source=udtInstancePath)
+								for row in res:
+									alarmObj = i3x.ignition.getAlarmObj(row)
+									elementObj["values"].append({"value":alarmObj, "quality":"Good", "timestamp":alarmObj["eventTime"], "isComposition":False})
+							except:
+								log.warn("Alarm journal query failed for %s; returning empty history" % elementId)
 						elif udtInstance["typeId"] != "folder-type" and udtInstance["typeId"] != "ignition-tag-provider":
 							children = i3x.utils.getChildrenObjectNames(udtInstance, "HasComponent")
 							tagConfig = system.tag.getConfiguration(udtInstancePath, True)

@@ -1,6 +1,9 @@
 IgnitionNamespaceUri = "https://inductiveautomation.com/UDT"
 UaCoreUri = "http://opcfoundation.org/UA/"
 DATE_FORMAT = "yyyy-MM-dd'T'HH:mm:ss.SSS'Z'"
+# Name of the alarm journal profile used for alarm history. Set this to match
+# the gateway's configured journal; if none exists, alarm history returns empty.
+ALARM_JOURNAL = "Journal"
 
 def getTagProviders():
 	tagProviders = []
