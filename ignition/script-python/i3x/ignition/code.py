@@ -272,8 +272,8 @@ def getUdtInstances():
 
 		# Ensure every relationship is stored bidirectionally so the graph is
 		# traversable from either node (spec: "All relationships MUST be stored
-		# bidirectionally"). This fills missing reverse edges — e.g. the
-		# HasChildren reverse of a child's HasParent on a UDT parent — without
+		# bidirectionally"). This fills missing reverse edges - e.g. the
+		# HasChildren reverse of a child's HasParent on a UDT parent - without
 		# overwriting any to-one edge already set above.
 		REVERSE = {"HasParent":"HasChildren", "HasChildren":"HasParent", "HasComponent":"ComponentOf", "ComponentOf":"HasComponent", "HasAlarm":"AlarmOf", "AlarmOf":"HasAlarm"}
 		TO_MANY = ("HasChildren", "HasComponent", "HasAlarm")

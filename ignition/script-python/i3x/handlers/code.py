@@ -21,22 +21,23 @@ def handleResponse(request, errorCode, isBulk, bulkError, error, result):
 
 def _respond(request, jsonStr):
 	# The spec requires gzip when the client advertises Accept-Encoding: gzip.
-	from java.lang import String
-	from java.io import ByteArrayOutputStream
-	from java.util.zip import GZIPOutputStream
-
-	acceptEncoding = None
-	servletRequest = request.get("servletRequest", None)
-	if servletRequest is not None:
-		acceptEncoding = servletRequest.getHeader("Accept-Encoding")
-
-	if acceptEncoding is not None and "gzip" in acceptEncoding.lower():
-		baos = ByteArrayOutputStream()
-		gz = GZIPOutputStream(baos)
-		gz.write(String(jsonStr).getBytes("UTF-8"))
-		gz.close()
-		request["servletResponse"].setHeader("Content-Encoding", "gzip")
-		return {'response': baos.toByteArray(), 'contentType': 'application/json'}
+	# This runs outside the handler try/except, so any failure must fall back to
+	# an uncompressed response rather than surfacing as a 500.
+	try:
+		servletRequest = request.get("servletRequest", None)
+		acceptEncoding = servletRequest.getHeader("Accept-Encoding") if servletRequest is not None else None
+		if acceptEncoding is not None and "gzip" in str(acceptEncoding).lower():
+			from java.lang import String
+			from java.io import ByteArrayOutputStream
+			from java.util.zip import GZIPOutputStream
+			baos = ByteArrayOutputStream()
+			gz = GZIPOutputStream(baos)
+			gz.write(String(jsonStr).getBytes("UTF-8"))
+			gz.close()
+			request["servletResponse"].setHeader("Content-Encoding", "gzip")
+			return {'response': baos.toByteArray(), 'contentType': 'application/json'}
+	except:
+		system.util.getLogger("i3x").warn("gzip encoding failed; sending uncompressed response")
 
 	return {'json': jsonStr}
 
@@ -296,7 +297,7 @@ def getObjects(typeId=None, includeMetadata=False, root=None, elementIds=None, c
 
 	bulkError = False
 
-	# Parse the history time range once, up front — not inside the per-element
+	# Parse the history time range once, up front - not inside the per-element
 	# loop (re-parsing an already-parsed Date would throw on the 2nd element).
 	startDate = None
 	endDate = None
