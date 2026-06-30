@@ -8,49 +8,56 @@ class I3XTagChangeListener(TagChangeListener):
 		self.elementId = elementId
 		self.udtInstance = udtInstance
 		self.subscription = subscription
-		
+
 	def tagChanged(self, tagChangeEvent):
 		if self.udtInstance["typeId"] == "ignition-alarm":
 			alarmObj = i3x.ignition.getAlarmFromSource(self.udtInstance["path"])["alarmObj"]
-			quality = "GOOD"
-			timestamp = alarmObj["eventTime"]
-			value = {"value":alarmObj, "quality":quality, "timestamp":timestamp}
+			entry = {"value":alarmObj, "quality":"Good", "timestamp":alarmObj["eventTime"]}
 		else:
 			value = i3x.ignition.getTagValue(self.udtInstance, tagChangeEvent.getValue())
-		
-		if value != None:
-			newValue = {}
-			newValue.update(value["value"])
-			newValue["elementId"] = self.elementId
-			newValue["sequenceNumber"] = self.subscription["sequenceNumber"]
-			self.subscription["sequenceNumber"] += 1
-			self.subscription["queuedUpdates"].append(newValue)
-		
+			if value is None:
+				return
+			vqt = value["value"]
+			entry = {"value":vqt["value"], "quality":vqt["quality"], "timestamp":vqt["timestamp"]}
+
+		# SyncUpdateEntry shape: {elementId, value, quality, timestamp}
+		update = {"elementId":self.elementId}
+		update.update(entry)
+
+		# Stage the update for the next sync(). Mutated from tag threads while
+		# sync() reads from web threads, so guard with the subscription lock.
+		lock = self.subscription["lock"]
+		with lock:
+			staged = self.subscription["stagedUpdates"]
+			wasFull = staged.maxlen is not None and len(staged) == staged.maxlen
+			staged.append(update)
+			if wasFull:
+				self.subscription["overflow"] = True
+
 def subscribe(elementId, tagPathStr, udtInstance, subscription):
 	from com.inductiveautomation.ignition.gateway import IgnitionGateway
 	from com.inductiveautomation.ignition.common.tags.paths.parser import TagPathParser
-	
+
 	context = IgnitionGateway.get()
 	tagManager = context.getTagManager()
-	
+
 	if udtInstance["typeId"] == "ignition-alarm":
 		tagPathStr = i3x.utils.alarmSourceToStateTagPath(tagPathStr)
 
 	tagPath = TagPathParser.parse(tagPathStr)
 	listener = I3XTagChangeListener(elementId, tagPathStr, udtInstance, subscription)
-	subscription["listeners"][elementId] = listener
 	tagManager.subscribeAsync(tagPath, listener)
-	
-def unsubscribe(elementId, tagPathStr, udtInstance, subscription):
+	return listener
+
+def unsubscribe(tagPathStr, udtInstance, listener):
 	from com.inductiveautomation.ignition.gateway import IgnitionGateway
 	from com.inductiveautomation.ignition.common.tags.paths.parser import TagPathParser
-	
+
 	context = IgnitionGateway.get()
 	tagManager = context.getTagManager()
-	
+
 	if udtInstance["typeId"] == "ignition-alarm":
 		tagPathStr = i3x.utils.alarmSourceToStateTagPath(tagPathStr)
 
 	tagPath = TagPathParser.parse(tagPathStr)
-	tagManager.unsubscribeAsync(tagPath, subscription["listeners"][elementId])
-	del subscription["listeners"][elementId]
+	tagManager.unsubscribeAsync(tagPath, listener)

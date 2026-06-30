@@ -120,7 +120,7 @@ def getAlarmDetails(row, key):
 		if str(k) == "ackUser":
 			val = None if v is None else v.toString()
 		elif str(k) == "eventTime":
-			val = system.date.format(v, DATE_FORMAT)
+			val = i3x.utils.formatUtc(v)
 		else:
 			val = v
 		newData[str(k)] = val
@@ -174,7 +174,7 @@ def parseAlarms(res):
 		
 		if source not in alarms:
 			alarms[source] = rowObj
-		elif system.date.isAfter(system.date.parse(alarmObj["eventTime"], DATE_FORMAT), system.date.parse(alarms[source]["alarmObj"]["eventTime"], DATE_FORMAT)):
+		elif system.date.isAfter(i3x.utils.parseUtc(alarmObj["eventTime"]), i3x.utils.parseUtc(alarms[source]["alarmObj"]["eventTime"])):
 			alarms[source] = rowObj
 	return alarms
 
@@ -189,9 +189,17 @@ def getAlarmFromSource(source):
 	return alarms[source]
 
 def getUdtInstances():
+	# The structural model is expensive to build (browses every provider, every
+	# UDT instance, and queries alarm status). Cache it briefly so a burst of
+	# requests doesn't rebuild it each time. Live values/history are read fresh
+	# elsewhere; only the structure (and last-known alarm status) is cached.
+	cached = i3x.utils.cacheGet("udtInstances")
+	if cached is not None:
+		return cached
+
 	ret = {}
-	
-	tagProviders = getTagProviders()	
+
+	tagProviders = getTagProviders()
 	for tagProvider in tagProviders:
 		tpPath = "[%s]" % tagProvider
 		tpTypes = "[%s]_types_/" % tagProvider
@@ -263,7 +271,8 @@ def getUdtInstances():
 			udtInstance["isComposition"] = udtInstance["type"] == "udt" and len(udtInstance["childrenUdts"]) > 0
 		
 		ret.update(udtInstances)
-					
+
+	i3x.utils.cacheSet("udtInstances", ret)
 	return ret
 
 def parseTags(path, config):
@@ -288,11 +297,11 @@ def parseTags(path, config):
 				
 				if "value" in row:
 					if dataType == "DateTime":
-						tag["default"] = system.date.format(row["value"], DATE_FORMAT)
+						tag["default"] = i3x.utils.formatUtc(row["value"])
 					elif dataType == "DateTimeArray":
 						newVal = []
 						for val in row["value"]:
-							newVal.append(system.date.format(val, DATE_FORMAT))
+							newVal.append(i3x.utils.formatUtc(val))
 						tag["default"] = newVal
 					elif dataType == "DataSet":
 						tag["default"] = system.dataset.toCSV(row["value"], True)
@@ -441,7 +450,7 @@ def getTagValue(udtInstance, value):
 		objValue = value.value.toDict()
 		childrenValues = i3x.utils.removeChildren(objValue, children)
 		quality = value.quality.toString()
-		timestamp = system.date.format(value.timestamp, i3x.ignition.DATE_FORMAT)
+		timestamp = i3x.utils.formatUtc(value.timestamp)
 		return {"value":{"value":objValue, "quality":quality, "timestamp":timestamp}, "childrenValues":childrenValues}
 	
 	return None

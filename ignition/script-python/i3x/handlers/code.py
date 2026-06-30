@@ -2,26 +2,44 @@ SPEC_VERSION = "1.0"
 
 def handleResponse(request, errorCode, isBulk, bulkError, error, result):
 	resp = request["servletResponse"]
-	
-	if errorCode == 200:
+	resp.setStatus(errorCode)
+
+	# 2xx (200 OK, 206 Partial Content) carry the success/result envelope.
+	if 200 <= errorCode < 300:
 		ret = {
 			"success": not bulkError,
-			"result" if not isBulk else "results": result
+			"results" if isBulk else "result": result
 		}
-		
 		return {'json': system.util.jsonEncode(ret)}
-	else:
-		resp.setStatus(errorCode)
-		
-		ret = {
-			"success": False,
-			"error": {
-				"code": errorCode,
-				"message": error
-			}
-		}
-		
-		return {'json': system.util.jsonEncode(ret)}
+
+	# Everything else uses the spec ErrorResponse {success:false, responseDetail}.
+	ret = {
+		"success": False,
+		"responseDetail": i3x.utils.errorDetail(errorCode, error)
+	}
+	return {'json': system.util.jsonEncode(ret)}
+
+def serverError(loggerName):
+	# Log the full traceback server-side; never leak internals to the client.
+	import traceback
+	system.util.getLogger(loggerName).error(traceback.format_exc())
+	return (500, False, "Internal server error", None)
+
+def bulkOk(result, elementId=None, subscriptionId=None):
+	item = {"success": True, "result": result}
+	if elementId is not None:
+		item["elementId"] = elementId
+	if subscriptionId is not None:
+		item["subscriptionId"] = subscriptionId
+	return item
+
+def bulkErr(status, detail, elementId=None, subscriptionId=None):
+	item = {"success": False, "result": None, "responseDetail": i3x.utils.errorDetail(status, detail)}
+	if elementId is not None:
+		item["elementId"] = elementId
+	if subscriptionId is not None:
+		item["subscriptionId"] = subscriptionId
+	return item
 
 def getInfo():
 	ret = {
@@ -118,24 +136,10 @@ def getRelationshipTypes(namespaceUri=None, elementIds=None):
 		for elementId in elementIds:
 			if elementId != None:
 				if elementId in relationships:
-					obj = relationships[elementId]
-					ret.append({
-						"success": True,
-						"elementId": elementId,
-						"result": obj,
-						"error": None
-					})
+					ret.append(bulkOk(relationships[elementId], elementId=elementId))
 				else:
 					bulkError = True
-					ret.append({
-						"success": False,
-						"elementId": elementId,
-						"result": None,
-						"error": {
-							"code": 404,
-							"message": "Relationship type not found: %s" % elementId
-						}
-					})
+					ret.append(bulkErr(404, "Relationship type not found: %s" % elementId, elementId=elementId))
 		
 	return (200, bulkError, None, ret)
 	
@@ -283,26 +287,13 @@ def getObjectTypes(namespaceUri=None, elementIds=None):
 					obj = {"elementId":dtElementId, "displayName":row["name"], "namespaceUri":dtNamespaceUri, "sourceTypeId":dtElementId, "version": "1.0.0", "schema":i3x.ignition.buildSchema(row, tagProvider, dtNamespaceUri)}
 					
 					if isBulk:
-						ret.append({
-							"success": True,
-							"elementId": elementId,
-							"result": obj,
-							"error": None
-						})
+						ret.append(bulkOk(obj, elementId=elementId))
 					else:
 						ret.append(obj)
-		
+
 		if isBulk and not foundElementId:
 			bulkError = True
-			ret.append({
-				"success": False,
-				"elementId": elementId,
-				"result": None,
-				"error": {
-					"code": 404,
-					"message": "Object type not found: %s" % elementId
-				}
-			})
+			ret.append(bulkErr(404, "Object type not found: %s" % elementId, elementId=elementId))
 	
 	return (200, bulkError, None, ret)
 	
@@ -358,53 +349,45 @@ def getObjects(typeId=None, includeMetadata=False, root=None, elementIds=None, c
 						retObj.extend(i3x.utils.getRelatedObjects(relationshipType, "HasComponent", udtInstance, udtInstances, includeMetadata))
 						retObj.extend(i3x.utils.getRelatedObjects(relationshipType, "HasAlarm", udtInstance, udtInstances, includeMetadata))
 						
-						ret.append({
-							"success": True,
-							"elementId": elementId,
-							"result": retObj,
-							"error": None
-						})
+						ret.append(bulkOk(retObj, elementId=elementId))
 					elif callType == "value":
-						elementObj = {"isComposition":udtInstance["isComposition"]}
+						# value/quality/timestamp are required by CurrentValueResult;
+						# folders and providers have no value, so default to GoodNoData.
+						elementObj = {"value":None, "quality":"GoodNoData", "timestamp":i3x.utils.formatUtc(system.date.now()), "isComposition":udtInstance["isComposition"]}
 						childrenValues = {}
 						quality = None
 						timestamp = None
-						
+
 						if udtInstance["typeId"] == "ignition-alarm":
 							alarmObj = udtInstance["alarmObj"]
 							quality = "Good"
 							timestamp = alarmObj["eventTime"]
 							elementObj = {"value":udtInstance["alarmObj"], "quality":quality, "timestamp":timestamp, "isComposition":False}
 						elif udtInstance["typeId"] != "folder-type" and udtInstance["typeId"] != "ignition-tag-provider":
-							value = system.tag.readBlocking([udtInstancePath])[0]			
+							value = system.tag.readBlocking([udtInstancePath])[0]
 							value = i3x.ignition.getTagValue(udtInstance, value)
 							if value != None:
 								elementObj.update(value["value"])
 								childrenValues = value["childrenValues"]
 								quality = value["value"]["quality"]
 								timestamp = value["value"]["timestamp"]
-								
+
 							i3x.utils.addChildrenValues(udtInstances, udtInstance, elementObj, childrenValues, quality, timestamp, 2, maxDepth)
-							
-						ret.append({
-							"success": True,
-							"elementId": elementId,
-							"result": elementObj,
-							"error": None
-						})
+
+						ret.append(bulkOk(elementObj, elementId=elementId))
 					elif callType == "history":
 						elementObj = {"values":[], "isComposition":udtInstance["isComposition"]}
-						
+
 						if udtInstance["typeId"] == "ignition-alarm":
-							startTime = system.date.parse(startTime, i3x.ignition.DATE_FORMAT)
-							endTime = system.date.parse(endTime, i3x.ignition.DATE_FORMAT)
+							startTime = i3x.utils.parseUtc(startTime)
+							endTime = i3x.utils.parseUtc(endTime)
 							res = system.alarm.queryJournal(startTime, endTime, journalName="Journal", source=udtInstancePath)
 							for row in res:
 								alarmObj = i3x.ignition.getAlarmObj(row)
 								elementObj["values"].append({"value":alarmObj, "quality":"Good", "timestamp":alarmObj["eventTime"], "isComposition":False})
 						elif udtInstance["typeId"] != "folder-type" and udtInstance["typeId"] != "ignition-tag-provider":
-							startTime = i3x.utils.getLocalTime(startTime)
-							endTime = i3x.utils.getLocalTime(endTime)
+							startTime = i3x.utils.parseUtc(startTime)
+							endTime = i3x.utils.parseUtc(endTime)
 							children = i3x.utils.getChildrenObjectNames(udtInstance, "HasComponent")
 							tagConfig = system.tag.getConfiguration(udtInstancePath, True)
 							if len(tagConfig) and "tags" in tagConfig[0]:
@@ -432,202 +415,149 @@ def getObjects(typeId=None, includeMetadata=False, root=None, elementIds=None, c
 									
 									i3x.utils.addChildrenHistory(elementObj, objs, historyValues)
 						
-						ret.append({
-							"success": True,
-							"elementId": elementId,
-							"result": elementObj,
-							"error": None
-						})
+						ret.append(bulkOk(elementObj, elementId=elementId))
 					else:
-						ret.append({
-							"success": True,
-							"elementId": elementId,
-							"result": obj,
-							"error": None
-						})
-						
+						ret.append(bulkOk(obj, elementId=elementId))
+
 			if not found:
 				bulkError = True
-				ret.append({
-					"success": False,
-					"elementId": elementId,
-					"result": None,
-					"error": {
-						"code": 404,
-						"message": "Element not found: %s" % elementId
-					}
-				})
+				ret.append(bulkErr(404, "Element not found: %s" % elementId, elementId=elementId))
 	
 	return (200, bulkError, None, ret)
-	
+
+def _subscribeItem(subscription, elementId, maxDepth, udtInstances):
+	# Expand to the element plus its composition descendants (per maxDepth) and
+	# subscribe a listener to each, so every child streams its own update.
+	expanded = i3x.utils.expandMonitoredItem(elementId, maxDepth, udtInstances)
+	listeners = []
+	for (listenElementId, tagPath, udtInstance) in expanded:
+		listener = i3x.tag.subscribe(listenElementId, tagPath, udtInstance, subscription)
+		listeners.append((tagPath, udtInstance, listener))
+	subscription["listeners"][elementId] = listeners
+	subscription["monitoredItems"][elementId] = maxDepth
+
+def _unsubscribeItem(subscription, elementId):
+	for (tagPath, udtInstance, listener) in subscription["listeners"].get(elementId, []):
+		i3x.tag.unsubscribe(tagPath, udtInstance, listener)
+	if elementId in subscription["listeners"]:
+		del subscription["listeners"][elementId]
+	if elementId in subscription["monitoredItems"]:
+		del subscription["monitoredItems"][elementId]
+
 def getSubscriptions(callType, requestData=None):
 	log = system.util.getLogger("i3x.subscriptions")
-	
+
 	bulkError = False
-	
+
 	clientId = requestData.get("clientId", None)
-	if clientId == None:
-		clientId = "None"
-		#return (404, bulkError, "Client Id not specified", {})
-	
+	if clientId is None:
+		return (400, False, "clientId is required", None)
+
 	subscriptionIds = i3x.utils.getSubscriptions(clientId)
 	if callType == "list":
 		ret = []
-		inSubscriptionIds = requestData.get("subscriptionIds", [])
-		subscriptions = []
-		for subscriptionId in inSubscriptionIds:
+		for subscriptionId in requestData.get("subscriptionIds", []):
 			if subscriptionId in subscriptionIds:
 				subscription = subscriptionIds[subscriptionId]
-				obj = {"subscriptionId":subscriptionId, "displayName":subscription["displayName"], "monitoredObjects":[{"elementId":elementId, "maxDepth":1} for elementId in subscription["elementIds"]]}
-				ret.append({
-					"success": True,
-					"subscriptionId": subscriptionId,
-					"result": obj,
-					"error": None
-				})
+				monitoredObjects = [{"elementId":eid, "maxDepth":md} for eid, md in subscription["monitoredItems"].items()]
+				obj = {"subscriptionId":subscriptionId, "displayName":subscription["displayName"], "monitoredObjects":monitoredObjects}
+				ret.append(bulkOk(obj, subscriptionId=subscriptionId))
 			else:
 				bulkError = True
-				ret.append({
-					"success": False,
-					"subscriptionId": subscriptionId,
-					"result": None,
-					"error": {
-						"code": 404,
-						"message": "Subscription not found: %s" % subscriptionId
-					}
-				})
+				ret.append(bulkErr(404, "Subscription not found: %s" % subscriptionId, subscriptionId=subscriptionId))
 	elif callType == "create":
 		displayName = requestData.get("displayName", clientId)
-		ret = {}
-		ret["clientId"] = clientId
-		ret["displayName"] = displayName
-		ret["subscriptionId"] = i3x.utils.createSubscription(clientId, displayName)
+		subscriptionId = i3x.utils.createSubscription(clientId, displayName)
+		ret = {"clientId":clientId, "subscriptionId":subscriptionId, "displayName":displayName}
 	elif callType == "delete":
 		ret = []
-		inSubscriptionIds = requestData.get("subscriptionIds", [])
-		subscriptions = []
-		for subscriptionId in inSubscriptionIds:
+		for subscriptionId in requestData.get("subscriptionIds", []):
 			if subscriptionId in subscriptionIds:
-				udtInstances = i3x.ignition.getUdtInstances()
 				subscription = subscriptionIds[subscriptionId]
-				for elementId in subscription["elementIds"]:
-					tagPath = i3x.utils.elementIdToPath(elementId)
-					udtInstance = udtInstances[tagPath]
-					i3x.tag.unsubscribe(elementId, tagPath, udtInstance, subscription)
-				
+				with subscription["lock"]:
+					for elementId in list(subscription["monitoredItems"].keys()):
+						_unsubscribeItem(subscription, elementId)
 				i3x.utils.deleteSubscription(clientId, subscriptionId)
-				
-				ret.append({
-					"success": True,
-					"subscriptionId": subscriptionId,
-					"result": None,
-					"error": None
-				})
+				ret.append(bulkOk(None, subscriptionId=subscriptionId))
 			else:
 				bulkError = True
-				ret.append({
-					"success": False,
-					"subscriptionId": subscriptionId,
-					"result": None,
-					"error": {
-						"code": 404,
-						"message": "Subscription not found: %s" % subscriptionId
-					}
-				})
+				ret.append(bulkErr(404, "Subscription not found: %s" % subscriptionId, subscriptionId=subscriptionId))
 	elif callType == "register":
 		subscriptionId = requestData.get("subscriptionId", None)
 		inElementIds = requestData.get("elementIds", [])
-		
+		maxDepth = requestData.get("maxDepth", 1)
+		if maxDepth is None:
+			maxDepth = 1
+
 		if subscriptionId == None or subscriptionId not in subscriptionIds:
-			return (404, bulkError, "Subscription not found", {})
-		else:
-			ret = []
-			udtInstances = i3x.ignition.getUdtInstances()
-			elementIds = [objValue["elementId"] for objKey, objValue in udtInstances.iteritems()]
-			
-			subscription = subscriptionIds[subscriptionId]
-			for elementId in inElementIds:
-				if elementId not in elementIds:
-					bulkError = True
-					ret.append({
-						"success": False,
-						"subscriptionId": subscriptionId,
-						"elementId": elementId,
-						"result": None,
-						"error": {
-							"code": 404,
-							"message": "Element not found: %s" % elementId
-						}
-					})
-				else:
-					subscription["elementIds"].append(elementId)
-					tagPath = i3x.utils.elementIdToPath(elementId)
-					udtInstance = udtInstances[tagPath]
-					i3x.tag.subscribe(elementId, tagPath, udtInstance, subscription)
-					ret.append({
-						"success": True,
-						"subscriptionId": subscriptionId,
-						"elementId": elementId,
-						"result": None,
-						"error": None
-					})
+			return (404, False, "Subscription not found", None)
+
+		ret = []
+		udtInstances = i3x.ignition.getUdtInstances()
+		validElementIds = set(inst["elementId"] for inst in udtInstances.values())
+		subscription = subscriptionIds[subscriptionId]
+
+		for elementId in inElementIds:
+			if elementId not in validElementIds:
+				bulkError = True
+				ret.append(bulkErr(404, "Element not found: %s" % elementId, elementId=elementId, subscriptionId=subscriptionId))
+			else:
+				with subscription["lock"]:
+					# Re-registering replaces the prior monitor so its listeners
+					# are cleaned up rather than leaked.
+					if elementId in subscription["monitoredItems"]:
+						_unsubscribeItem(subscription, elementId)
+					_subscribeItem(subscription, elementId, maxDepth, udtInstances)
+				ret.append(bulkOk(None, elementId=elementId, subscriptionId=subscriptionId))
 	elif callType == "unregister":
 		subscriptionId = requestData.get("subscriptionId", None)
 		inElementIds = requestData.get("elementIds", [])
-		
+
 		if subscriptionId == None or subscriptionId not in subscriptionIds:
-			return (404, bulkError, "Subscription not found", {})
-		else:
-			ret = []
-			udtInstances = i3x.ignition.getUdtInstances()
-			elementIds = [objValue["elementId"] for objKey, objValue in udtInstances.iteritems()]
-			
-			subscription = subscriptionIds[subscriptionId]
-			for elementId in inElementIds:
-				if elementId not in subscription["elementIds"]:
-					bulkError = True
-					ret.append({
-						"success": False,
-						"subscriptionId": subscriptionId,
-						"elementId": elementId,
-						"result": None,
-						"error": {
-							"code": 404,
-							"message": "Element not found: %s" % elementId
-						}
-					})
-				else:
-					tagPath = i3x.utils.elementIdToPath(elementId)
-					udtInstance = udtInstances[tagPath]
-					i3x.tag.unsubscribe(elementId, tagPath, udtInstance, subscription)
-					ret.append({
-						"success": True,
-						"subscriptionId": subscriptionId,
-						"elementId": elementId,
-						"result": None,
-						"error": None
-					})
-					
-			subscription["elementIds"] = [elementId for elementId in subscription["elementIds"] if elementId not in inElementIds]
-			subscriptionIds[subscriptionId]["queuedUpdates"].clear()
+			return (404, False, "Subscription not found", None)
+
+		ret = []
+		subscription = subscriptionIds[subscriptionId]
+		for elementId in inElementIds:
+			if elementId not in subscription["monitoredItems"]:
+				bulkError = True
+				ret.append(bulkErr(404, "Element not found: %s" % elementId, elementId=elementId, subscriptionId=subscriptionId))
+			else:
+				with subscription["lock"]:
+					_unsubscribeItem(subscription, elementId)
+				ret.append(bulkOk(None, elementId=elementId, subscriptionId=subscriptionId))
 	elif callType == "sync":
 		subscriptionId = requestData.get("subscriptionId", None)
 		lastSequenceNumber = requestData.get("lastSequenceNumber", None)
-		
+
 		if subscriptionId == None or subscriptionId not in subscriptionIds:
-			return (404, bulkError, "Subscription not found", {})
-		else:
-			subscription = subscriptionIds[subscriptionId]
+			return (404, False, "Subscription not found", None)
+
+		subscription = subscriptionIds[subscriptionId]
+		with subscription["lock"]:
+			batches = subscription["batches"]
+
+			# Acknowledge: drop every batch at or below the client's high-water mark.
 			if lastSequenceNumber != None:
-				idx = -1
-				for row in list(subscription["queuedUpdates"]):
-					if row["sequenceNumber"] <= lastSequenceNumber:
-						idx += 1
-			
-				if idx > -1:
-					for _ in range(idx+1):
-						subscriptionIds[subscriptionId]["queuedUpdates"].popleft()
-				
-			ret = list(subscription["queuedUpdates"])
-			
+				while batches and batches[0]["sequenceNumber"] <= lastSequenceNumber:
+					batches.popleft()
+
+			# Bundle everything staged since the last sync into one new batch.
+			staged = subscription["stagedUpdates"]
+			if len(staged):
+				batch = {"sequenceNumber":subscription["sequenceNumber"], "updates":list(staged)}
+				subscription["sequenceNumber"] += 1
+				staged.clear()
+				wasFull = batches.maxlen is not None and len(batches) == batches.maxlen
+				batches.append(batch)
+				if wasFull:
+					subscription["overflow"] = True
+
+			# 206 signals the client that some updates were dropped on overflow.
+			overflow = subscription["overflow"]
+			subscription["overflow"] = False
+			ret = list(batches)
+
+		return (206 if overflow else 200, False, None, ret)
+
 	return (200, bulkError, None, ret)

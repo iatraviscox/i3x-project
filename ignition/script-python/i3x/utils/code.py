@@ -1,16 +1,84 @@
-def getLocalTime(utcTime):
+# --- Timestamps -------------------------------------------------------------
+# All i3X timestamps are RFC 3339 UTC (e.g. "2026-06-30T12:00:00.000Z").
+# parseUtc turns an incoming string into an absolute java.util.Date (no zone
+# assumptions); formatUtc renders any java.util.Date back as UTC. The previous
+# implementation hard-coded America/Los_Angeles, which corrupted timestamps on
+# any gateway not running in Pacific time.
+
+def parseUtc(utcTime):
 	from java.time import Instant
-	from java.time import ZoneId
-	from java.time import ZonedDateTime
 	from java.util import Date
+	if utcTime is None:
+		return None
+	# Date.from(...) can't be called from Jython ("from" is a keyword), so build
+	# the Date from epoch millis instead.
+	return Date(Instant.parse(utcTime).toEpochMilli())
+
+def formatUtc(date):
+	from java.time import ZoneOffset
 	from java.time.format import DateTimeFormatter
-	
-	instant = Instant.parse(utcTime)
-	localZone = ZoneId.of("America/Los_Angeles")
-	localTime = instant.atZone(localZone)
-	formatter = DateTimeFormatter.ofPattern(i3x.ignition.DATE_FORMAT)
-	localTime = localTime.format(formatter)
-	return system.date.parse(localTime, i3x.ignition.DATE_FORMAT)
+	if date is None:
+		return None
+	formatter = DateTimeFormatter.ofPattern(i3x.ignition.DATE_FORMAT).withZone(ZoneOffset.UTC)
+	return formatter.format(date.toInstant())
+
+# --- Error helpers ----------------------------------------------------------
+# The i3X spec models errors as ErrorDetail {title, status, detail}.
+REASON_PHRASES = {
+	400: "Bad Request",
+	401: "Unauthorized",
+	403: "Forbidden",
+	404: "Not Found",
+	409: "Conflict",
+	500: "Internal Server Error",
+	501: "Not Implemented",
+	503: "Service Unavailable"
+}
+
+def errorDetail(status, detail, title=None):
+	return {
+		"title": title if title else REASON_PHRASES.get(status, "Error"),
+		"status": status,
+		"detail": detail if detail else REASON_PHRASES.get(status, "Error")
+	}
+
+# --- Model cache ------------------------------------------------------------
+# The structural model (instances, type schemas) is expensive to rebuild on
+# every request. We cache it briefly in gateway globals. Live values, history
+# and alarm status are always read fresh; only the structure map is cached.
+CACHE_TTL_MS = 5000
+
+def getCacheStore():
+	from threading import RLock
+	g = system.util.getGlobals()
+	store = g.get("i3x.cache", None)
+	if store is None:
+		store = {"data": {}, "lock": RLock()}
+		g["i3x.cache"] = store
+	return store
+
+def cacheGet(key):
+	from java.lang import System
+	store = getCacheStore()
+	with store["lock"]:
+		entry = store["data"].get(key, None)
+		if entry is None:
+			return None
+		expiry, value = entry
+		if System.currentTimeMillis() > expiry:
+			return None
+		return value
+
+def cacheSet(key, value, ttlMs=CACHE_TTL_MS):
+	from java.lang import System
+	store = getCacheStore()
+	with store["lock"]:
+		store["data"][key] = (System.currentTimeMillis() + ttlMs, value)
+
+def cacheClear():
+	store = getCacheStore()
+	with store["lock"]:
+		store["data"].clear()
 
 def setStatus(request, code, error):
 	response = request['servletResponse']
@@ -77,7 +145,7 @@ def buildUdtInstanceObj(udtInstance, includeMetadata):
 	typeId = udtInstance["typeId"]
 	if typeId not in ["ignition-alarm"]:
 		typeId = pathToElementId(typeId)
-	obj = {"elementId":udtInstance["elementId"], "typeElementIdId":typeId, "displayName":udtInstance["name"], "parentId":udtInstance["parentId"], "isComposition":udtInstance["isComposition"], "isExtended":len(udtInstance["parameters"]) > 0}
+	obj = {"elementId":udtInstance["elementId"], "typeElementId":typeId, "displayName":udtInstance["name"], "parentId":udtInstance["parentId"], "isComposition":udtInstance["isComposition"], "isExtended":len(udtInstance["parameters"]) > 0}
 	if includeMetadata:
 		obj["metadata"] = {
 			"typeNamespaceUri": udtInstance["namespaceUri"],
@@ -231,13 +299,50 @@ def getSubscriptions(clientId=None):
 	
 def createSubscription(clientId, displayName):
 	from java.util import UUID
-	from collections import deque
-	
+	from collections import deque, OrderedDict
+	from threading import RLock
+
 	subscriptions = getSubscriptions(clientId)
 	uuid = str(UUID.randomUUID())
-	
-	subscriptions[uuid] = {"displayName":displayName, "created":system.date.now(), "elementIds":[], "isStreaming":False, "queuedUpdates":deque(maxlen=i3x.tag.MAX_QUEUE_SIZE), "listeners":{}, "sequenceNumber":1}
+
+	subscriptions[uuid] = {
+		"displayName": displayName,
+		"created": system.date.now(),
+		# requested elementId -> maxDepth
+		"monitoredItems": OrderedDict(),
+		# requested elementId -> [(tagPath, udtInstance, listener), ...]
+		"listeners": {},
+		# SyncUpdateEntry dicts awaiting the next sync()
+		"stagedUpdates": deque(maxlen=i3x.tag.MAX_QUEUE_SIZE),
+		# SyncBatch dicts already handed to (or pending for) the client
+		"batches": deque(maxlen=i3x.tag.MAX_QUEUE_SIZE),
+		"sequenceNumber": 1,
+		"overflow": False,
+		"lock": RLock()
+	}
 	return uuid
+
+def expandMonitoredItem(elementId, maxDepth, udtInstances):
+	# Returns [(elementId, tagPath, udtInstance), ...] for the element and its
+	# HasComponent descendants, honouring maxDepth (1=self only, 0=infinite).
+	# Folders and tag providers have no value and are skipped (we still descend
+	# through them). This lets each composition child stream its own update.
+	ret = []
+	tagPath = elementIdToPath(elementId)
+	if tagPath not in udtInstances:
+		return ret
+
+	def recurse(inst, depth):
+		if inst["typeId"] not in ("folder-type", "ignition-tag-provider"):
+			ret.append((inst["elementId"], inst["path"], inst))
+		if depth < maxDepth or maxDepth == 0:
+			for childElementId in inst.get("relationships", {}).get("HasComponent", []):
+				childPath = elementIdToPath(childElementId)
+				if childPath in udtInstances:
+					recurse(udtInstances[childPath], depth + 1)
+
+	recurse(udtInstances[tagPath], 1)
+	return ret
 
 def deleteSubscription(clientId, subscriptionId):
 	subscriptions = getSubscriptions(clientId)
