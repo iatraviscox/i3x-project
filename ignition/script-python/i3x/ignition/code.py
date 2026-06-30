@@ -269,7 +269,43 @@ def getUdtInstances():
 			udtInstance["parentId"] = parentId
 			udtInstance["relationships"] = relationships
 			udtInstance["isComposition"] = udtInstance["type"] == "udt" and len(udtInstance["childrenUdts"]) > 0
-		
+
+		# Ensure every relationship is stored bidirectionally so the graph is
+		# traversable from either node (spec: "All relationships MUST be stored
+		# bidirectionally"). This fills missing reverse edges — e.g. the
+		# HasChildren reverse of a child's HasParent on a UDT parent — without
+		# overwriting any to-one edge already set above.
+		REVERSE = {"HasParent":"HasChildren", "HasChildren":"HasParent", "HasComponent":"ComponentOf", "ComponentOf":"HasComponent", "HasAlarm":"AlarmOf", "AlarmOf":"HasAlarm"}
+		TO_MANY = ("HasChildren", "HasComponent", "HasAlarm")
+		byElementId = {}
+		for udtInstancePath in udtInstances:
+			byElementId[udtInstances[udtInstancePath]["elementId"]] = udtInstances[udtInstancePath]
+
+		for udtInstancePath in udtInstances:
+			udtInstance = udtInstances[udtInstancePath]
+			srcId = udtInstance["elementId"]
+			for rel, targets in list(udtInstance["relationships"].items()):
+				if rel not in REVERSE:
+					continue
+				rev = REVERSE[rel]
+				targetList = targets if isinstance(targets, list) else [targets]
+				for tgt in targetList:
+					if tgt == None or tgt == "/" or tgt not in byElementId:
+						continue
+					targetRels = byElementId[tgt]["relationships"]
+					if rev in TO_MANY:
+						existing = targetRels.get(rev)
+						if existing == None:
+							targetRels[rev] = [srcId]
+						elif isinstance(existing, list):
+							if srcId not in existing:
+								existing.append(srcId)
+						elif existing != srcId:
+							targetRels[rev] = [existing, srcId]
+					elif rev not in targetRels:
+						# to-one reverse: fill only if absent, never overwrite
+						targetRels[rev] = srcId
+
 		ret.update(udtInstances)
 
 	i3x.utils.cacheSet("udtInstances", ret)

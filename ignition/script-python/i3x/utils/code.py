@@ -143,7 +143,10 @@ def getNamespaceUriParam(row):
 	
 def buildUdtInstanceObj(udtInstance, includeMetadata):
 	typeId = udtInstance["typeId"]
-	if typeId not in ["ignition-alarm"]:
+	# Built-in types are registered under their literal ids; only real UDT type
+	# paths get base64-encoded into elementIds. Encoding the built-ins here would
+	# make typeElementId fail to resolve against GET /objecttypes.
+	if typeId not in ["ignition-alarm", "folder-type", "ignition-tag-provider"]:
 		typeId = pathToElementId(typeId)
 	obj = {"elementId":udtInstance["elementId"], "typeElementId":typeId, "displayName":udtInstance["name"], "parentId":udtInstance["parentId"], "isComposition":udtInstance["isComposition"], "isExtended":len(udtInstance["parameters"]) > 0}
 	if includeMetadata:

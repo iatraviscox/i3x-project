@@ -10,14 +10,35 @@ def handleResponse(request, errorCode, isBulk, bulkError, error, result):
 			"success": not bulkError,
 			"results" if isBulk else "result": result
 		}
-		return {'json': system.util.jsonEncode(ret)}
+	else:
+		# Everything else uses the spec ErrorResponse {success:false, responseDetail}.
+		ret = {
+			"success": False,
+			"responseDetail": i3x.utils.errorDetail(errorCode, error)
+		}
 
-	# Everything else uses the spec ErrorResponse {success:false, responseDetail}.
-	ret = {
-		"success": False,
-		"responseDetail": i3x.utils.errorDetail(errorCode, error)
-	}
-	return {'json': system.util.jsonEncode(ret)}
+	return _respond(request, system.util.jsonEncode(ret))
+
+def _respond(request, jsonStr):
+	# The spec requires gzip when the client advertises Accept-Encoding: gzip.
+	from java.lang import String
+	from java.io import ByteArrayOutputStream
+	from java.util.zip import GZIPOutputStream
+
+	acceptEncoding = None
+	servletRequest = request.get("servletRequest", None)
+	if servletRequest is not None:
+		acceptEncoding = servletRequest.getHeader("Accept-Encoding")
+
+	if acceptEncoding is not None and "gzip" in acceptEncoding.lower():
+		baos = ByteArrayOutputStream()
+		gz = GZIPOutputStream(baos)
+		gz.write(String(jsonStr).getBytes("UTF-8"))
+		gz.close()
+		request["servletResponse"].setHeader("Content-Encoding", "gzip")
+		return {'response': baos.toByteArray(), 'contentType': 'application/json'}
+
+	return {'json': jsonStr}
 
 def serverError(loggerName):
 	# Log the full traceback server-side; never leak internals to the client.
@@ -236,72 +257,58 @@ def getObjectTypes(namespaceUri=None, elementIds=None):
 		}
 	}}}
 
-	tagProviders = i3x.ignition.getTagProviders()
-	
-	if elementIds != None:
-		isBulk = True
-		ret = []
-		if "folder-type" in elementIds:
-			ret.append(folderObj)
-		if "ignition-tag-provider" in elementIds:
-			ret.append(tagProviderObj)
-		if "ignition-alarm" in elementIds:
-			ret.append(alarmObj)
-	else:
-		isBulk = False
-		elementIds = [None]
-		ret = []
-		if namespaceUri == None or namespaceUri == i3x.ignition.UaCoreUri:
-			ret.append(folderObj)	
-		
-		if namespaceUri == None or namespaceUri == i3x.ignition.IgnitionNamespaceUri:
-			ret.append(tagProviderObj)
-		
-		if namespaceUri == None or namespaceUri == i3x.ignition.IgnitionNamespaceUri:
-			ret.append(alarmObj)
-	
-	for elementId in elementIds:
-		foundElementId = False
-		udtDef = None
-		udtDefTagProvider = None
-		if elementId != None:
-			if elementId in ["folder-type", "ignition-tag-provider", "ignition-alarm"]:
-				continue
-				
-			udtDef = i3x.utils.elementIdToPath(elementId)
-			udtDefTagProvider = i3x.utils.getTagProviderFromPath(udtDef)
-		
-		for tagProvider in tagProviders:
-			if udtDefTagProvider != None and tagProvider != udtDefTagProvider:
-				continue
-			
-			res = i3x.ignition.getUdtDefs(tagProvider, udtDef)
-			for row in res:
+	from collections import OrderedDict
+
+	# Build (and briefly cache) the full type map keyed by elementId: the three
+	# built-in types plus every UDT definition across all providers. Serving
+	# from this map lets bulk queries preserve request order and report unknown
+	# ids as per-item 404s without decoding caller-supplied strings.
+	allTypes = i3x.utils.cacheGet("objectTypes")
+	if allTypes is None:
+		allTypes = OrderedDict()
+		allTypes["folder-type"] = folderObj
+		allTypes["ignition-tag-provider"] = tagProviderObj
+		allTypes["ignition-alarm"] = alarmObj
+		for tagProvider in i3x.ignition.getTagProviders():
+			for row in i3x.ignition.getUdtDefs(tagProvider):
 				dtNamespaceUri = i3x.utils.getNamespaceUriParam(row)
 				dtElementId = i3x.utils.pathToElementId(str(row["fullPath"]))
-				
-				if namespaceUri == None or namespaceUri == dtNamespaceUri:
-					if dtElementId == elementId:
-						foundElementId = True
-						
-					obj = {"elementId":dtElementId, "displayName":row["name"], "namespaceUri":dtNamespaceUri, "sourceTypeId":dtElementId, "version": "1.0.0", "schema":i3x.ignition.buildSchema(row, tagProvider, dtNamespaceUri)}
-					
-					if isBulk:
-						ret.append(bulkOk(obj, elementId=elementId))
-					else:
-						ret.append(obj)
+				allTypes[dtElementId] = {"elementId":dtElementId, "displayName":row["name"], "namespaceUri":dtNamespaceUri, "sourceTypeId":dtElementId, "version":"1.0.0", "schema":i3x.ignition.buildSchema(row, tagProvider, dtNamespaceUri)}
+		i3x.utils.cacheSet("objectTypes", allTypes)
 
-		if isBulk and not foundElementId:
-			bulkError = True
-			ret.append(bulkErr(404, "Object type not found: %s" % elementId, elementId=elementId))
-	
-	return (200, bulkError, None, ret)
+	if elementIds is not None:
+		# Bulk: preserve request order, per-item 404 for unknown ids.
+		ret = []
+		for elementId in elementIds:
+			if elementId in allTypes:
+				ret.append(bulkOk(allTypes[elementId], elementId=elementId))
+			else:
+				bulkError = True
+				ret.append(bulkErr(404, "Object type not found: %s" % elementId, elementId=elementId))
+		return (200, bulkError, None, ret)
+
+	# Non-bulk: optionally filter by namespace.
+	ret = [obj for obj in allTypes.values() if namespaceUri == None or obj["namespaceUri"] == namespaceUri]
+	return (200, False, None, ret)
 	
 def getObjects(typeId=None, includeMetadata=False, root=None, elementIds=None, callType="list", relationshipType=None, maxDepth=1, startTime=None, endTime=None):
 	log = system.util.getLogger("i3x.objects")
-	
+
 	bulkError = False
-		
+
+	# Parse the history time range once, up front — not inside the per-element
+	# loop (re-parsing an already-parsed Date would throw on the 2nd element).
+	startDate = None
+	endDate = None
+	if callType == "history":
+		if startTime == None or endTime == None:
+			return (400, False, "startTime and endTime are required (RFC 3339)", None)
+		try:
+			startDate = i3x.utils.parseUtc(startTime)
+			endDate = i3x.utils.parseUtc(endTime)
+		except:
+			return (400, False, "startTime and endTime must be RFC 3339 timestamps", None)
+
 	if typeId != None:
 		typeId = i3x.utils.elementIdToPath(typeId)
 
@@ -379,23 +386,19 @@ def getObjects(typeId=None, includeMetadata=False, root=None, elementIds=None, c
 						elementObj = {"values":[], "isComposition":udtInstance["isComposition"]}
 
 						if udtInstance["typeId"] == "ignition-alarm":
-							startTime = i3x.utils.parseUtc(startTime)
-							endTime = i3x.utils.parseUtc(endTime)
-							res = system.alarm.queryJournal(startTime, endTime, journalName="Journal", source=udtInstancePath)
+							res = system.alarm.queryJournal(startDate, endDate, journalName="Journal", source=udtInstancePath)
 							for row in res:
 								alarmObj = i3x.ignition.getAlarmObj(row)
 								elementObj["values"].append({"value":alarmObj, "quality":"Good", "timestamp":alarmObj["eventTime"], "isComposition":False})
 						elif udtInstance["typeId"] != "folder-type" and udtInstance["typeId"] != "ignition-tag-provider":
-							startTime = i3x.utils.parseUtc(startTime)
-							endTime = i3x.utils.parseUtc(endTime)
 							children = i3x.utils.getChildrenObjectNames(udtInstance, "HasComponent")
 							tagConfig = system.tag.getConfiguration(udtInstancePath, True)
 							if len(tagConfig) and "tags" in tagConfig[0]:
 								objs = {"tags":[], "objects":{}}
 								tags = i3x.utils.getTags(udtInstancePath, objs, tagConfig[0]["tags"], 1, maxDepth)
 								if len(tags):
-									minutes = system.date.minutesBetween(startTime, endTime)
-									res = system.historian.queryAggregatedPoints(paths=tags, startTime=startTime, endTime=endTime, aggregates=["LastValue"] * len(tags), fillModes=["PREV"] * len(tags), returnFormat="WIDE", returnSize=minutes, includeBounds=True)
+									minutes = system.date.minutesBetween(startDate, endDate)
+									res = system.historian.queryAggregatedPoints(paths=tags, startTime=startDate, endTime=endDate, aggregates=["LastValue"] * len(tags), fillModes=["PREV"] * len(tags), returnFormat="WIDE", returnSize=max(1, minutes), includeBounds=True)
 									cols = res.getColumnNames()
 									historyValues = []
 									prevValues = None
