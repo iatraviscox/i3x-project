@@ -386,32 +386,45 @@ def _currentValue(udtInstance, udtInstances, maxDepth):
 	return elementObj
 
 def _queryHistory(tags, startDate, endDate):
-	# Query the historian for a set of tag paths over [startDate, endDate] and
-	# return change-only rows (consecutive-identical and all-null rows dropped).
+	# TEMP DIAGNOSTIC: probe queryRawPoints parameter combinations and log the
+	# resulting row counts so we can pick the one that actually returns raw data.
+	# Return the RAW stored historian points for a set of tag paths over
+	# [startDate, endDate] - no resampling, aggregation, or fill.
 	#
-	# NOTE: sampling is heuristic - one LastValue bucket per minute with PREV
-	# fill. It bounds the result size and de-duplicates, but loses sub-minute
-	# detail. This is the single place to change history resolution (e.g. use
-	# returnSize=-1 for natural/raw points).
-	minutes = system.date.minutesBetween(startDate, endDate)
-	res = system.historian.queryAggregatedPoints(paths=tags, startTime=startDate, endTime=endDate, aggregates=["LastValue"] * len(tags), fillModes=["PREV"] * len(tags), returnFormat="WIDE", returnSize=max(1, minutes), includeBounds=True)
-	cols = res.getColumnNames()
-	historyValues = []
-	prevValues = None
-	for row in res:
-		timestamp = row[0]
-		rowValues = {}
-		allNull = True
-		for i in range(1, len(cols)):
-			rowValues[cols[i]] = row[i]
-			if row[i] != None:
-				allNull = False
+	# Each tag is queried individually: queryRawPoints in multi-path form returns
+	# nothing on this historian (the per-tag stored timestamps don't align across
+	# paths), whereas a single-path WIDE query returns every stored point. We then
+	# merge the per-tag series into composite rows keyed by timestamp - each row
+	# carries the value of any tag with a stored point at that exact timestamp and
+	# null for tags that don't, so every non-null value is a real recorded point.
+	# queryRawPoints can return boundary points just outside the window (most
+	# visible for sparse tags), so filter strictly to the requested range.
+	startMillis = startDate.getTime()
+	endMillis = endDate.getTime()
+	byTimestamp = {}   # epoch millis -> {tag: value}
+	tsByKey = {}       # epoch millis -> original timestamp Date
+	for tag in tags:
+		res = system.historian.queryRawPoints(paths=[tag], startTime=startDate, endTime=endDate, returnFormat="WIDE", includeBounds=False)
+		cols = res.getColumnNames()
+		if len(cols) < 2:
+			continue
+		for row in res:
+			timestamp = row[0]
+			key = timestamp.getTime()
+			if key < startMillis or key > endMillis:
+				continue
+			if key not in byTimestamp:
+				byTimestamp[key] = {}
+				tsByKey[key] = timestamp
+			byTimestamp[key][tag] = row[1]
 
-		# Keep only rows that changed and aren't entirely null.
-		if rowValues != prevValues and not allNull:
-			prevValues = dict(rowValues)
-			rowValues["t_stamp"] = timestamp
-			historyValues.append(rowValues)
+	historyValues = []
+	for key in sorted(byTimestamp.keys()):
+		rowValues = {}
+		for tag in tags:
+			rowValues[tag] = byTimestamp[key].get(tag, None)
+		rowValues["t_stamp"] = tsByKey[key]
+		historyValues.append(rowValues)
 	return historyValues
 
 def _historyValue(udtInstance, maxDepth, startDate, endDate, log):

@@ -335,7 +335,11 @@ def addChildrenHistory(elementObj, objs, historyValues):
 			if "components" not in elementObj:
 				elementObj["components"] = {}
 
-			elementObj["components"][pathToElementId(tagPathGen2ToGen1(obj))] = subElementObj
+			# obj is already a Gen1 tag path (the getTags key), so encode it
+			# directly - running it through tagPathGen2ToGen1 double-prefixed the
+			# provider (e.g. "[default][default]CNC1/...") and produced a component
+			# elementId that didn't resolve to the real object.
+			elementObj["components"][pathToElementId(obj)] = subElementObj
 			addChildrenHistory(subElementObj, subObjs, historyValues)
 
 # --- Subscription state -----------------------------------------------------
