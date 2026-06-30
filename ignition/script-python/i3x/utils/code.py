@@ -1,3 +1,9 @@
+# i3x.utils
+# ---------
+# Shared helpers used across the i3X handlers: UTC timestamp conversion, the
+# error-envelope builder, the short-lived model cache, elementId<->tag-path
+# encoding, response shaping for objects/relationships, and subscription state.
+
 # --- Timestamps -------------------------------------------------------------
 # All i3X timestamps are RFC 3339 UTC (e.g. "2026-06-30T12:00:00.000Z").
 # parseUtc turns an incoming string into an absolute java.util.Date (no zone
@@ -6,6 +12,7 @@
 # any gateway not running in Pacific time.
 
 def parseUtc(utcTime):
+	# RFC 3339 string -> java.util.Date (absolute instant). None passes through.
 	from java.time import Instant
 	from java.util import Date
 	if utcTime is None:
@@ -15,6 +22,7 @@ def parseUtc(utcTime):
 	return Date(Instant.parse(utcTime).toEpochMilli())
 
 def formatUtc(date):
+	# java.util.Date -> RFC 3339 UTC string. None passes through.
 	from java.time import ZoneOffset
 	from java.time.format import DateTimeFormatter
 	if date is None:
@@ -36,6 +44,7 @@ REASON_PHRASES = {
 }
 
 def errorDetail(status, detail, title=None):
+	# Build an ErrorDetail, defaulting title/detail to the status reason phrase.
 	return {
 		"title": title if title else REASON_PHRASES.get(status, "Error"),
 		"status": status,
@@ -49,6 +58,7 @@ def errorDetail(status, detail, title=None):
 CACHE_TTL_MS = 5000
 
 def getCacheStore():
+	# Lazily create the shared cache (a dict + lock) in gateway globals.
 	from threading import RLock
 	g = system.util.getGlobals()
 	store = g.get("i3x.cache", None)
@@ -58,6 +68,7 @@ def getCacheStore():
 	return store
 
 def cacheGet(key):
+	# Return the cached value for key, or None if absent or expired.
 	from java.lang import System
 	store = getCacheStore()
 	with store["lock"]:
@@ -70,32 +81,43 @@ def cacheGet(key):
 		return value
 
 def cacheSet(key, value, ttlMs=CACHE_TTL_MS):
+	# Cache value under key for ttlMs milliseconds.
 	from java.lang import System
 	store = getCacheStore()
 	with store["lock"]:
 		store["data"][key] = (System.currentTimeMillis() + ttlMs, value)
 
 def cacheClear():
+	# Drop everything from the cache (e.g. after bulk UDT changes).
 	store = getCacheStore()
 	with store["lock"]:
 		store["data"].clear()
 
 def setStatus(request, code, error):
+	# Low-level helper to set a status and return a raw JSON body.
 	response = request['servletResponse']
 	response.setStatus(code)
 	return {"json":system.util.jsonEncode(error)}
 
+# --- ElementId <-> tag path -------------------------------------------------
+# An elementId is the URL-safe base64 of a tag path, giving every object a
+# stable, opaque, URL-safe identifier that round-trips back to its path.
+
 def pathToElementId(path):
+	# Tag path -> URL-safe base64 elementId (no padding).
 	from java.util import Base64
 	return Base64.getUrlEncoder().withoutPadding().encodeToString(path)
 
 def elementIdToPath(elementId):
+	# elementId -> tag path. Raises on malformed base64 (callers must guard).
 	from java.util import Base64
 	from java.lang import String
 	from java.nio.charset import StandardCharsets
 	return str(String(Base64.getUrlDecoder().decode(elementId), StandardCharsets.UTF_8))
 
 def tagPathGen1ToGen2(tagPath):
+	# Convert a Gen1 path "[provider]Folder/Tag" to a Gen2 path
+	# "prov:provider:/tag:Folder/Tag" (the form the historian expects).
 	import re
 	match = re.search(r"\[(.*?)\]", tagPath)
 	tagProvider = "default"
@@ -103,36 +125,43 @@ def tagPathGen1ToGen2(tagPath):
 		tagProvider = match.group(1)
 		tagPath = re.sub(r"\[.*?\]", "", tagPath)
 	return "prov:%s:/tag:%s" % (tagProvider, tagPath)
-	
+
 def tagPathGen2ToGen1(tagPath):
+	# Inverse of tagPathGen1ToGen2: Gen2 path -> "[provider]Folder/Tag".
 	parts = tagPath.split(":/")
 	if len(parts) > 1:
 		tagPath = "[%s]%s" % (parts[0].replace("prov:", ""), parts[1].replace("tag:", ""))
 	else:
 		tagPath = "[default]%s" % parts[0].replace("tag:", "")
 	return tagPath
-	
+
 def alarmSourceToStateTagPath(source):
+	# Turn an alarm source qualifier into the alarm's .State tag path, which is
+	# what we subscribe to for alarm change notifications.
 	parts = source.split(":/")
 	return "[%s]%s/Alarms/%s.State" % (parts[0].replace("prov:", ""), parts[1].replace("tag:", ""), parts[2].replace("alm:", ""))
 
 def getTagProviderFromPath(path):
+	# Extract the provider name from a "[provider]..." path, or None.
 	import re
 	match = re.search(r"\[(.*?)\]", path)
 	if match:
 		return match.group(1)
 	return None
-	
+
 def getTagNameFromPath(path):
+	# Return the final, provider-stripped segment of a tag path (the tag name).
 	import re
 	if path != None and path != "":
 		pathParts = path.split("/")
 		tagName = re.sub(r"\[.*?\]", "", pathParts[-1])
 		return tagName
-		
+
 	return None
 
 def getNamespaceUriParam(row):
+	# Read a UDT's NamespaceUri parameter, defaulting to the Ignition UDT
+	# namespace when the parameter isn't present.
 	from com.inductiveautomation.ignition.common.tags.config.properties import ParameterValue
 	from com.inductiveautomation.ignition.common.sqltags.model.types import DataTypeClass
 	if "parameters" in row and row["parameters"] != None:
@@ -140,8 +169,10 @@ def getNamespaceUriParam(row):
 		return paramValue if isinstance(paramValue, basestring) else paramValue.value
 	else:
 		return i3x.ignition.IgnitionNamespaceUri
-	
+
 def buildUdtInstanceObj(udtInstance, includeMetadata):
+	# Shape an internal udtInstance record into an i3X ObjectInstanceResponse.
+	# includeMetadata adds type provenance, relationships, and UDT parameters.
 	typeId = udtInstance["typeId"]
 	# Built-in types are registered under their literal ids; only real UDT type
 	# paths get base64-encoded into elementIds. Encoding the built-ins here would
@@ -154,20 +185,23 @@ def buildUdtInstanceObj(udtInstance, includeMetadata):
 			"typeNamespaceUri": udtInstance["namespaceUri"],
 			"sourceTypeId":typeId
 		}
-		
+
 		if len(udtInstance["relationships"]):
 			obj["metadata"]["relationships"] = udtInstance["relationships"]
-		
+
 		if len(udtInstance["parameters"]):
 			obj["metadata"]["system"] = {
 				"parameters": udtInstance["parameters"]
 			}
-		
+
 	return obj
 
 def getRelatedObjects(filterRelationshipType, relationshipType, obj, udtInstances, includeMetadata):
+	# Return RelatedObjectResult entries for one relationship type on obj. When
+	# filterRelationshipType is set, only that relationship is emitted. Handles
+	# both to-many (list) and to-one (scalar) edges.
 	ret = []
-	
+
 	if filterRelationshipType == None or filterRelationshipType == relationshipType:
 		if relationshipType in obj["relationships"]:
 			if isinstance(obj["relationships"][relationshipType], list):
@@ -188,12 +222,15 @@ def getRelatedObjects(filterRelationshipType, relationshipType, obj, udtInstance
 	return ret
 
 def getChildrenObjects(obj, relationshipType):
+	# Tag paths of obj's related children for a relationship type.
 	ret = []
 	if relationshipType in obj["relationships"]:
 		ret = [i3x.utils.elementIdToPath(rChildPath) for rChildPath in obj["relationships"][relationshipType]]
 	return ret
 
 def getChildrenObjectNames(obj, relationshipType):
+	# Like getChildrenObjects but returns names relative to obj (path prefix
+	# stripped) - the keys under which children appear in a UDT's value document.
 	ret = []
 	objPath = obj["path"] + "/"
 	if relationshipType in obj["relationships"]:
@@ -201,14 +238,17 @@ def getChildrenObjectNames(obj, relationshipType):
 	return ret
 
 def removeChildren(objValue, children):
+	# Split a UDT value document: pop each composition child's sub-value out of
+	# objValue (mutating it) and return those sub-values keyed by child name, so
+	# the parent value carries only its own members and children recurse separately.
 	ret = {}
 	keysToRemove = []
-	
+
 	for child in children:
 		parts = child.split("/")
 		if parts[0] in objValue and parts[0] not in keysToRemove:
 			keysToRemove.append(parts[0])
-		
+
 		childValue = objValue
 		for part in parts:
 			if part not in childValue:
@@ -218,13 +258,16 @@ def removeChildren(objValue, children):
 				childValue = childValue[part]
 
 		ret[child] = childValue
-	
+
 	for key in keysToRemove:
 		del objValue[key]
-	
+
 	return ret
-	
+
 def addChildrenValues(udtInstances, udtInstance, elementObj, childrenValues, quality, timestamp, currentDepth, maxDepth):
+	# Recursively attach composition child values under elementObj["components"],
+	# honoring maxDepth (1=this element only, 0=infinite). childrenValues holds
+	# the sub-values already separated out of the parent by removeChildren.
 	if currentDepth <= maxDepth or maxDepth == 0:
 		objPath = udtInstance["path"] + "/"
 		children = getChildrenObjects(udtInstance, "HasComponent")
@@ -239,20 +282,24 @@ def addChildrenValues(udtInstances, udtInstance, elementObj, childrenValues, qua
 				subChildren = getChildrenObjectNames(udtInstances[child], "HasComponent")
 				subChildrenValues = removeChildren(value, subChildren)
 				value = {"value":value, "quality":quality, "timestamp":timestamp, "isComposition":udtInstances[child]["isComposition"]}
-			
+
 			if "components" not in elementObj:
 				elementObj["components"] = {}
-				
+
 			elementObj["components"][childElementId] = value
 			addChildrenValues(udtInstances, udtInstances[child], elementObj["components"][childElementId], subChildrenValues, quality, timestamp, currentDepth + 1, maxDepth)
 
 def getTags(path, objs, tags, currentDepth=1, maxDepth=1):
+	# Walk a UDT's tag configuration to maxDepth, collecting the Gen2 paths of all
+	# historizable atomic tags (flattened across folders). objs accumulates the
+	# nested structure (atomic tag paths + nested UDT instances) so history can
+	# later be re-shaped per composition child.
 	ret = []
 	if currentDepth <= maxDepth or maxDepth == 0:
 		for tag in tags:
 			tagPath = "%s/%s" % (path, tag["path"])
 			tagType = str(tag["tagType"])
-			
+
 			if tagType == "Folder":
 				ret.extend(getTags(tagPath, objs, tag["tags"], currentDepth, maxDepth))
 			elif tagType == "UdtInstance":
@@ -264,10 +311,12 @@ def getTags(path, objs, tags, currentDepth=1, maxDepth=1):
 				tp = tagPathGen1ToGen2(tagPath)
 				ret.append(tp)
 				objs["tags"].append(tp)
-			
+
 	return ret
-	
+
 def addChildrenHistory(elementObj, objs, historyValues):
+	# Shape flat historian rows (one column per tag) into HistoricalValueResult
+	# records, recursing into nested composition children under "components".
 	if len(objs["tags"]):
 		for row in historyValues:
 			rowValues = {}
@@ -275,32 +324,39 @@ def addChildrenHistory(elementObj, objs, historyValues):
 				tagPath = tagPathGen2ToGen1(tag)
 				tagName = getTagNameFromPath(tagPath)
 				rowValues[tagName] = row[tag]
-			elementObj["values"].append({"value":rowValues, "quality":"Good", "timestamp":system.date.format(row["t_stamp"], i3x.ignition.DATE_FORMAT)})
-			
+			elementObj["values"].append({"value":rowValues, "quality":"Good", "timestamp":formatUtc(row["t_stamp"])})
+
 	if len(objs["objects"]):
 		elementObj["isComposition"] = True
 		for obj in objs["objects"]:
 			subObjs = objs["objects"][obj]
 			subElementObj = {"values":[], "isComposition":False}
-			
+
 			if "components" not in elementObj:
 				elementObj["components"] = {}
-			
+
 			elementObj["components"][pathToElementId(tagPathGen2ToGen1(obj))] = subElementObj
 			addChildrenHistory(subElementObj, subObjs, historyValues)
-			
+
+# --- Subscription state -----------------------------------------------------
+# Subscriptions live in gateway globals, keyed by clientId then subscriptionId,
+# so they survive across requests and are isolated per client.
+
 def getSubscriptions(clientId=None):
+	# Return the subscription map for a client, creating empty maps as needed.
 	globalsObj = system.util.getGlobals()
-	
+
 	if "i3x.subscriptions" not in globalsObj:
 		globalsObj["i3x.subscriptions"] = {}
-		
+
 	if clientId != None and clientId not in globalsObj["i3x.subscriptions"]:
 		globalsObj["i3x.subscriptions"][clientId] = {}
-		
+
 	return globalsObj["i3x.subscriptions"][clientId]
-	
+
 def createSubscription(clientId, displayName):
+	# Create a subscription with empty monitored-item/listener/queue state and
+	# return its generated id. See i3x.tag for how the queues are fed/drained.
 	from java.util import UUID
 	from collections import deque, OrderedDict
 	from threading import RLock
@@ -348,5 +404,6 @@ def expandMonitoredItem(elementId, maxDepth, udtInstances):
 	return ret
 
 def deleteSubscription(clientId, subscriptionId):
+	# Remove a subscription record (listeners must be torn down by the caller first).
 	subscriptions = getSubscriptions(clientId)
 	del subscriptions[subscriptionId]
