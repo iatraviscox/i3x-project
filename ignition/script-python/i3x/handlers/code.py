@@ -434,15 +434,18 @@ def _historyValue(udtInstance, maxDepth, startDate, endDate, log):
 	udtInstancePath = udtInstance["path"]
 
 	if udtInstance["typeId"] == "ignition-alarm":
-		# Alarm history needs an alarm journal profile. If none is configured (or
-		# the query fails), return empty history rather than failing with a 500.
+		# Alarm history comes from the alarm journal profile named by
+		# i3x.ignition.ALARM_JOURNAL, filtered to this alarm's source. If the
+		# journal is missing or misconfigured, log a clear warning and return
+		# empty history rather than failing the whole request with a 500.
 		try:
 			res = system.alarm.queryJournal(startDate, endDate, journalName=i3x.ignition.ALARM_JOURNAL, source=udtInstancePath)
 			for row in res:
 				alarmObj = i3x.ignition.getAlarmObj(row)
 				elementObj["values"].append({"value":alarmObj, "quality":"Good", "timestamp":alarmObj["eventTime"], "isComposition":False})
 		except:
-			log.warn("Alarm journal query failed for %s; returning empty history" % udtInstance["elementId"])
+			import traceback
+			log.warn("Alarm journal query failed for %s (journal '%s'): %s" % (udtInstance["elementId"], i3x.ignition.ALARM_JOURNAL, traceback.format_exc().splitlines()[-1]))
 	elif udtInstance["typeId"] != "folder-type" and udtInstance["typeId"] != "ignition-tag-provider":
 		# Collect the historizable leaf tags (recursing to maxDepth), query the
 		# historian for all of them at once, then shape into the response.
