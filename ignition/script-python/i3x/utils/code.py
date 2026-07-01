@@ -388,6 +388,11 @@ def createSubscription(clientId, displayName):
 		"batches": deque(maxlen=i3x.tag.MAX_QUEUE_SIZE),
 		"sequenceNumber": 1,
 		"overflow": False,
+		# SSE streaming state: streaming=True while a stream is open (blocks sync);
+		# streamToken bumps on each new stream so an older stream for the same
+		# subscription detects it and closes (single stream per subscription).
+		"streaming": False,
+		"streamToken": 0,
 		"lock": RLock()
 	}
 	return uuid

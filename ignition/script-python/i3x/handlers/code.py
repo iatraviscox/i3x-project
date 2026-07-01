@@ -91,8 +91,7 @@ def bulkErr(status, detail, elementId=None, subscriptionId=None):
 
 def getInfo():
 	# GET /info: server version and capability matrix. Public health check.
-	# Capabilities reflect what is actually implemented; writes and SSE streaming
-	# are not supported, so they are advertised as false.
+	# Capabilities reflect what is actually implemented; writes are not supported.
 	ret = {
 		"specVersion": SPEC_VERSION,
 		"serverVersion": system.util.getVersion().toString(),
@@ -106,7 +105,7 @@ def getInfo():
 				"history": False
 			},
 			"subscribe": {
-				"stream": False
+				"stream": True
 			}
 		}
 	}
@@ -560,6 +559,81 @@ def _unsubscribeItem(subscription, elementId):
 	if elementId in subscription["monitoredItems"]:
 		del subscription["monitoredItems"][elementId]
 
+def streamSubscription(request, requestData):
+	# POST /subscriptions/stream: push staged updates to the client as Server-Sent
+	# Events (at-most-once, no sequence numbers). Reuses the same staged-update
+	# queue that tag-change listeners feed; sync is blocked while a stream is open.
+	# Writes directly to the servlet stream and returns None so WebDev doesn't
+	# append its own body. NOTE: this holds a gateway web thread for the life of
+	# the stream (WebDev has no async-servlet API) - fine for a modest number of
+	# concurrent streams, not thousands.
+	import time
+	from java.lang import String
+	log = system.util.getLogger("i3x.subscriptions")
+
+	clientId = requestData.get("clientId", None)
+	if clientId is None:
+		return handleResponse(request, 400, False, False, "clientId is required", None)
+	subscriptionId = requestData.get("subscriptionId", None)
+	subscriptionIds = i3x.utils.getSubscriptions(clientId)
+	if subscriptionId is None or subscriptionId not in subscriptionIds:
+		return handleResponse(request, 404, False, False, "Subscription not found", None)
+
+	subscription = subscriptionIds[subscriptionId]
+
+	# Single stream per subscription: bump the token so any stream already running
+	# for this subscription sees the change on its next poll and exits.
+	with subscription["lock"]:
+		subscription["streamToken"] = subscription.get("streamToken", 0) + 1
+		myToken = subscription["streamToken"]
+		subscription["streaming"] = True
+
+	resp = request["servletResponse"]
+	resp.setStatus(200)
+	resp.setContentType("text/event-stream")
+	resp.setHeader("Cache-Control", "no-cache")
+	out = resp.getOutputStream()
+
+	POLL_SECONDS = 0.25
+	HEARTBEAT_POLLS = 40   # ~10s of idle between keep-alive comments
+	idle = 0
+	try:
+		while True:
+			with subscription["lock"]:
+				# A newer stream for this subscription has taken over - close this one.
+				if subscription["streamToken"] != myToken:
+					break
+				staged = subscription["stagedUpdates"]
+				updates = list(staged)
+				staged.clear()
+
+			# One SSE event per drain: a JSON array of {elementId,value,quality,timestamp}.
+			if updates:
+				out.write(String("data: %s\n\n" % system.util.jsonEncode(updates)).getBytes("UTF-8"))
+				out.flush()
+				idle = 0
+			else:
+				idle += 1
+				if idle >= HEARTBEAT_POLLS:
+					# Comment line: keeps the connection alive and surfaces a client
+					# disconnect (flush throws) during idle periods.
+					out.write(String(": keep-alive\n\n").getBytes("UTF-8"))
+					out.flush()
+					idle = 0
+
+			time.sleep(POLL_SECONDS)
+	except:
+		import traceback
+		log.info("Stream closed for subscription %s: %s" % (subscriptionId, traceback.format_exc().splitlines()[-1]))
+	finally:
+		# Only clear the flag if we're still the active stream (a newer stream may
+		# have superseded us and now owns the streaming state).
+		with subscription["lock"]:
+			if subscription.get("streamToken", 0) == myToken:
+				subscription["streaming"] = False
+
+	return None
+
 def getSubscriptions(callType, requestData=None):
 	# Backs every /subscriptions endpoint, dispatched by callType
 	# (create/list/delete/register/unregister/sync). Subscriptions are scoped to
@@ -657,10 +731,18 @@ def getSubscriptions(callType, requestData=None):
 
 		subscription = subscriptionIds[subscriptionId]
 		with subscription["lock"]:
+			# Streaming and sync are mutually exclusive for a subscription; the
+			# client must close the stream before polling sync.
+			if subscription.get("streaming", False):
+				return (409, False, "Subscription has an open stream; close the stream before calling sync", None)
+
 			batches = subscription["batches"]
 
-			# Acknowledge: drop every batch at or below the client's high-water mark.
-			if lastSequenceNumber != None:
+			# lastSequenceNumber == -1 acknowledges (clears) the entire queue;
+			# otherwise drop every batch at or below the client's high-water mark.
+			if lastSequenceNumber == -1:
+				batches.clear()
+			elif lastSequenceNumber != None:
 				while batches and batches[0]["sequenceNumber"] <= lastSequenceNumber:
 					batches.popleft()
 

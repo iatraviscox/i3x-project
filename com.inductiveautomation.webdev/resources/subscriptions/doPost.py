@@ -6,11 +6,11 @@ def doPost(request, session):
 		def endsWith(suffix):
 			return remainingPath != None and remainingPath != "" and remainingPath.endswith(suffix)
 
-		# SSE streaming is not supported (capabilities.subscribe.stream = false).
-		# Clients poll /subscriptions/sync instead. Reject explicitly rather than
-		# letting the request fall through to subscription creation.
+		# SSE streaming: open a Server-Sent Events stream for the subscription.
+		# streamSubscription writes directly to the servlet response and returns
+		# None (or a normal error response for a bad clientId/subscriptionId).
 		if endsWith("/stream"):
-			return i3x.handlers.handleResponse(request, 501, False, False, "Streaming is not supported; poll /subscriptions/sync instead", None)
+			return i3x.handlers.streamSubscription(request, requestData)
 
 		callType = "create"
 		isBulk = False

@@ -53,22 +53,46 @@ implemented:
 - `update.current` / `update.history` = **false** — write endpoints
   (`PUT /objects/value`, `PUT /objects/history`) are intentionally not
   implemented; the corresponding WebDev methods are disabled.
-- `subscribe.stream` = **false** — Server-Sent Events are not supported.
-  `POST /subscriptions/stream` returns `501`. Clients poll
-  `POST /subscriptions/sync` instead.
+- `subscribe.stream` = **true** — Server-Sent Events are supported (see below).
 
-## Subscriptions (polling model)
+## Subscriptions
+
+Register objects once, then consume value changes either by **polling** (`sync`,
+high QoS with acknowledgement) or by **streaming** (`stream`, SSE, at-most-once).
+The two are mutually exclusive per subscription.
 
 1. `POST /subscriptions` with a `clientId` → returns a `subscriptionId`.
 2. `POST /subscriptions/register` with `elementIds` and optional `maxDepth`
-   (1 = the element only, 0 = all composition descendants).
-3. Poll `POST /subscriptions/sync`. Each call returns all pending `SyncBatch`es.
-   Pass `lastSequenceNumber` to acknowledge (and drop) batches up to that point.
+   (1 = the element only, 0 = all composition descendants). The server begins
+   queuing value changes for those objects.
 
-Updates staged between syncs and the batches awaiting acknowledgement are each
-bounded (see `MAX_QUEUE_SIZE` in `i3x.tag`, default 1000). On overflow the
-oldest data is dropped and `sync` responds **`206 Partial Content`** so the
-client knows it missed updates and should resynchronise.
+### Sync (polling)
+
+Poll `POST /subscriptions/sync`. Each call returns all pending `SyncBatch`es.
+Pass `lastSequenceNumber` to acknowledge (and drop) batches up to that point;
+`lastSequenceNumber = -1` clears the whole queue. Staged updates and pending
+batches are each bounded (`MAX_QUEUE_SIZE` in `i3x.tag`, default 1000); on
+overflow the oldest data is dropped and `sync` responds **`206 Partial
+Content`** so the client knows it missed updates.
+
+### Stream (SSE)
+
+`POST /subscriptions/stream` opens a `text/event-stream`. Each event is a JSON
+array of updates: `data: [{"elementId":…,"value":…,"quality":…,"timestamp":…}]`.
+Queued changes are delivered first, then changes as they occur. There are no
+sequence numbers and no acknowledgement (at-most-once).
+
+- **Single stream per subscription**: opening a new stream closes any existing
+  one for the same subscription.
+- **Mutually exclusive with sync**: while a stream is open, `sync` returns
+  `409`. Close the stream (disconnect) before polling.
+- A `: keep-alive` comment is sent during idle periods to hold the connection
+  open and detect disconnects.
+
+> **Scaling note:** each open stream holds one gateway web-server thread for its
+> lifetime (WebDev exposes no async-servlet API). This is fine for a modest
+> number of concurrent streams; clients needing to scale to very many consumers
+> should prefer `sync` polling.
 
 ## Timestamps
 
