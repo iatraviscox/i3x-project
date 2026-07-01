@@ -8,6 +8,73 @@ The API is served by Ignition's **WebDev** module. Each endpoint resource is a
 thin `doGet`/`doPost` that delegates to the project scripting library under
 `i3x.*`, so the logic lives in one place.
 
+## Requirements
+
+- **Ignition 8.3+** (developed and tested on 8.3.2). The history endpoints use
+  the `system.historian` scripting API introduced in 8.3.
+- **WebDev module** — serves the HTTP endpoints.
+- **Tag Historian** (the 8.3 Historian) — only for tag-value history; tags must
+  be configured to store history.
+- **Alarm Journal profile** — only for alarm history (see step 3 below).
+
+## Installing into a Gateway
+
+This repository *is* an Ignition project folder — its top level contains
+`project.json`, the `ignition/script-python/i3x` library, and the
+`com.inductiveautomation.webdev` resources.
+
+### 1. Import the project
+
+Either:
+
+- **File-based (git workflow):** copy or clone this folder into
+  `<IgnitionInstall>/data/projects/<name>` on the gateway. The gateway detects
+  it and loads it automatically (you'll see `Restarting gateway scripts …
+  project=<name>` in `logs/wrapper.log`). This also lets you edit resources on
+  disk and have the gateway pick up changes.
+- **Gateway/Designer import:** on the gateway web UI, **Config → Projects →
+  Import**, or in the Designer **File → Import**, selecting a project export.
+
+Make sure the project is **enabled**. The **project name** determines the API
+base URL:
+
+```
+http(s)://<gateway>/system/webdev/<projectName>       e.g. …/system/webdev/i3x
+```
+
+Confirm it loaded: `GET /system/webdev/<projectName>/info` should return `200`
+with the capability matrix (this endpoint is public and needs no credentials).
+
+### 2. Configure authentication
+
+Every endpoint except `/info` requires authentication (`require-auth = true`).
+Choose the user source and roles that gate the API — see
+[Authentication](#authentication). At minimum the gateway needs a user source
+and a user your clients can authenticate as.
+
+### 3. Configure the alarm journal (for alarm history)
+
+Alarm history — `POST /objects/history` on an alarm object — reads from an
+**alarm journal profile**. Configure one under **Config → Alarming → Journal**.
+Its name must match `i3x.ignition.ALARM_JOURNAL` (default `"Journal"`): either
+name the journal `Journal`, or change that constant. Without a matching journal,
+alarm history returns empty and logs a warning under the `i3x.objects` logger
+(it does not error the request).
+
+### 4. Historize tags (for value history)
+
+`POST /objects/history` on a UDT returns stored historian data for that UDT's
+tags — only tags actually configured to store history return values.
+**Composition history** (nested UDT children under `components`) appears only
+when those child tags are historized; enable history on the relevant
+UDT-definition member tags. See [History](#history).
+
+### 5. (Optional) Namespaces
+
+A UDT definition can declare a `NamespaceUri` parameter to group its instances
+into an i3X namespace. UDTs without it fall under the default Ignition UDT
+namespace (`https://inductiveautomation.com/UDT`).
+
 ## Layout
 
 | Area | Path |
@@ -23,7 +90,7 @@ thin `doGet`/`doPost` that delegates to the project scripting library under
 `GET /info`, `GET /namespaces`, `GET|POST /objecttypes`,
 `GET|POST /relationshiptypes`, `GET /objects`, `POST /objects/list`,
 `POST /objects/related`, `POST /objects/value`, `POST /objects/history`,
-`POST /subscriptions`, `POST /subscriptions/{register,unregister,sync,delete,list}`.
+`POST /subscriptions`, `POST /subscriptions/{register,unregister,sync,stream,delete,list}`.
 
 ## Authentication
 
@@ -93,6 +160,23 @@ sequence numbers and no acknowledgement (at-most-once).
 > lifetime (WebDev exposes no async-servlet API). This is fine for a modest
 > number of concurrent streams; clients needing to scale to very many consumers
 > should prefer `sync` polling.
+
+## History
+
+`POST /objects/history` returns **raw stored points** — no resampling or
+aggregation — forward-filled into composite rows:
+
+- Each tag is queried individually (`system.historian.queryRawPoints`) and
+  merged on timestamp. At every change timestamp each tag shows its last
+  recorded value (last-observation-carried-forward), so a slow-changing tag
+  keeps its value across the rows where a fast tag moves. A tag is `null` only
+  before its first recorded value in the range.
+- `startTime` and `endTime` are **required** RFC 3339 timestamps (a missing or
+  malformed value returns `400`).
+- `maxDepth` controls composition recursion (1 = this object, 0 = all
+  descendants); child history appears under `components`.
+- For an **alarm** object, history is the alarm-journal events over the range
+  instead (see install step 3).
 
 ## Timestamps
 
