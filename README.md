@@ -25,25 +25,28 @@ This repository *is* an Ignition project folder — its top level contains
 
 ### 1. Import the project
 
-Either:
+The project **must be named `i3x`** — the WebDev base URL is derived from the
+project name, and the scripting library, endpoints, and docs all assume
+`/system/webdev/i3x`. Import it one of two ways:
 
 - **File-based (git workflow):** copy or clone this folder into
-  `<IgnitionInstall>/data/projects/<name>` on the gateway. The gateway detects
-  it and loads it automatically (you'll see `Restarting gateway scripts …
-  project=<name>` in `logs/wrapper.log`). This also lets you edit resources on
-  disk and have the gateway pick up changes.
+  `<IgnitionInstall>/data/projects/i3x` on the gateway (the folder name is the
+  project name, so it must be `i3x`). The gateway detects it and loads it
+  automatically (you'll see `Restarting gateway scripts … project=i3x` in
+  `logs/wrapper.log`). This also lets you edit resources on disk and have the
+  gateway pick up changes.
 - **Gateway/Designer import:** on the gateway web UI, **Config → Projects →
-  Import**, or in the Designer **File → Import**, selecting a project export.
+  Import**, or in the Designer **File → Import**, selecting a project export —
+  and set the project name to `i3x`.
 
-Make sure the project is **enabled**. The **project name** determines the API
-base URL:
+Make sure the project is **enabled**. The API is then served at:
 
 ```
-http(s)://<gateway>/system/webdev/<projectName>       e.g. …/system/webdev/i3x
+http(s)://<gateway>/system/webdev/i3x        e.g. …/system/webdev/i3x/info
 ```
 
-Confirm it loaded: `GET /system/webdev/<projectName>/info` should return `200`
-with the capability matrix (this endpoint is public and needs no credentials).
+Confirm it loaded: `GET /system/webdev/i3x/info` should return `200` with the
+capability matrix (this endpoint is public and needs no credentials).
 
 ### 2. Configure authentication
 
