@@ -1,6 +1,4 @@
 def doPost(request, session):
-	import traceback
-	
 	try:
 		requestData = request["postData"]
 		elementIds = requestData.get("elementIds", [])
@@ -12,18 +10,15 @@ def doPost(request, session):
 			callType = "value"
 		elif remainingPath != None and remainingPath != "" and remainingPath.endswith("/history"):
 			callType = "history"
-		
+
 		includeMetadata = requestData.get("includeMetadata", False)
 		relationshipType = requestData.get("relationshipType", None)
 		maxDepth = requestData.get("maxDepth", 1)
 		startTime = requestData.get("startTime", None)
 		endTime = requestData.get("endTime", None)
-		
+
 		(errorCode, bulkError, error, result) = i3x.handlers.getObjects(None, includeMetadata, False, elementIds, callType, relationshipType, maxDepth, startTime, endTime)
 	except:
-		errorCode = 500
-		bulkError = False
-		error = traceback.format_exc()
-		result = None
-		
+		(errorCode, bulkError, error, result) = i3x.handlers.serverError("i3x.objects")
+
 	return i3x.handlers.handleResponse(request, errorCode, True, bulkError, error, result)
