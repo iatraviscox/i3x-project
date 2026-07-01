@@ -386,43 +386,56 @@ def _currentValue(udtInstance, udtInstances, maxDepth):
 	return elementObj
 
 def _queryHistory(tags, startDate, endDate):
-	# TEMP DIAGNOSTIC: probe queryRawPoints parameter combinations and log the
-	# resulting row counts so we can pick the one that actually returns raw data.
-	# Return the RAW stored historian points for a set of tag paths over
-	# [startDate, endDate] - no resampling, aggregation, or fill.
+	# Return raw stored historian points, forward-filled into composite rows.
 	#
-	# Each tag is queried individually: queryRawPoints in multi-path form returns
-	# nothing on this historian (the per-tag stored timestamps don't align across
-	# paths), whereas a single-path WIDE query returns every stored point. We then
-	# merge the per-tag series into composite rows keyed by timestamp - each row
-	# carries the value of any tag with a stored point at that exact timestamp and
-	# null for tags that don't, so every non-null value is a real recorded point.
-	# queryRawPoints can return boundary points just outside the window (most
-	# visible for sparse tags), so filter strictly to the requested range.
+	# Each tag is queried individually: multi-path queryRawPoints returns nothing
+	# on this historian (per-tag stored timestamps don't align), whereas a
+	# single-path WIDE query returns every stored point. includeBounds=True also
+	# captures each tag's value carried in from just before the window.
+	#
+	# Output has one row per distinct in-window change timestamp (the union across
+	# all tags). At each row every tag shows its last recorded value as of that
+	# timestamp (last-observation-carried-forward) rather than null - so a tag
+	# that changes rarely (e.g. HOA) keeps showing its value across the many rows
+	# where a frequently-changing tag (e.g. Amps) moves. A tag is null only before
+	# its first recorded value.
 	startMillis = startDate.getTime()
 	endMillis = endDate.getTime()
-	byTimestamp = {}   # epoch millis -> {tag: value}
-	tsByKey = {}       # epoch millis -> original timestamp Date
-	for tag in tags:
-		res = system.historian.queryRawPoints(paths=[tag], startTime=startDate, endTime=endDate, returnFormat="WIDE", includeBounds=False)
-		cols = res.getColumnNames()
-		if len(cols) < 2:
-			continue
-		for row in res:
-			timestamp = row[0]
-			key = timestamp.getTime()
-			if key < startMillis or key > endMillis:
-				continue
-			if key not in byTimestamp:
-				byTimestamp[key] = {}
-				tsByKey[key] = timestamp
-			byTimestamp[key][tag] = row[1]
 
+	series = {}          # tag -> [(millis, value), ...] sorted ascending (all points, incl. bounds)
+	changeMillis = set() # in-window timestamps where some tag actually has a point
+	tsByKey = {}         # in-window millis -> original timestamp Date
+	for tag in tags:
+		res = system.historian.queryRawPoints(paths=[tag], startTime=startDate, endTime=endDate, returnFormat="WIDE", includeBounds=True)
+		cols = res.getColumnNames()
+		pts = []
+		if len(cols) >= 2:
+			for row in res:
+				timestamp = row[0]
+				key = timestamp.getTime()
+				pts.append((key, row[1]))
+				# Only in-window points create rows; out-of-window (bound) points
+				# still seed the carry-forward for the earliest in-window rows.
+				if startMillis <= key <= endMillis:
+					changeMillis.add(key)
+					tsByKey[key] = timestamp
+		pts.sort()
+		series[tag] = pts
+
+	# Walk the change timestamps in order, advancing each tag's carried value.
 	historyValues = []
-	for key in sorted(byTimestamp.keys()):
+	idx = dict((tag, 0) for tag in tags)
+	last = dict((tag, None) for tag in tags)
+	for key in sorted(changeMillis):
 		rowValues = {}
 		for tag in tags:
-			rowValues[tag] = byTimestamp[key].get(tag, None)
+			pts = series[tag]
+			i = idx[tag]
+			while i < len(pts) and pts[i][0] <= key:
+				last[tag] = pts[i][1]
+				i += 1
+			idx[tag] = i
+			rowValues[tag] = last[tag]
 		rowValues["t_stamp"] = tsByKey[key]
 		historyValues.append(rowValues)
 	return historyValues
