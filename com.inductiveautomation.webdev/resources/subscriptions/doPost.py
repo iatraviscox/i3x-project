@@ -1,32 +1,37 @@
 def doPost(request, session):
-	import traceback
-	
 	try:
 		requestData = request["postData"]
 		remainingPath = request["remainingPath"]
-		
+
+		def endsWith(suffix):
+			return remainingPath != None and remainingPath != "" and remainingPath.endswith(suffix)
+
+		# SSE streaming: open a Server-Sent Events stream for the subscription.
+		# streamSubscription writes directly to the servlet response and returns
+		# None (or a normal error response for a bad clientId/subscriptionId).
+		if endsWith("/stream"):
+			return i3x.handlers.streamSubscription(request, requestData)
+
 		callType = "create"
 		isBulk = False
-		if remainingPath != None and remainingPath != "" and remainingPath.endswith("/register"):
+		if endsWith("/register"):
 			callType = "register"
 			isBulk = True
-		elif remainingPath != None and remainingPath != "" and remainingPath.endswith("/unregister"):
+		elif endsWith("/unregister"):
 			callType = "unregister"
 			isBulk = True
-		elif remainingPath != None and remainingPath != "" and remainingPath.endswith("/sync"):
+		elif endsWith("/sync"):
 			callType = "sync"
-		elif remainingPath != None and remainingPath != "" and remainingPath.endswith("/delete"):
+		elif endsWith("/delete"):
 			callType = "delete"
 			isBulk = True
-		elif remainingPath != None and remainingPath != "" and remainingPath.endswith("/list"):
+		elif endsWith("/list"):
 			callType = "list"
 			isBulk = True
 
 		(errorCode, bulkError, error, result) = i3x.handlers.getSubscriptions(callType, requestData)
 	except:
-		errorCode = 500
-		bulkError = False
-		error = traceback.format_exc()
-		result = None
-		
+		(errorCode, bulkError, error, result) = i3x.handlers.serverError("i3x.subscriptions")
+		isBulk = False
+
 	return i3x.handlers.handleResponse(request, errorCode, isBulk, bulkError, error, result)

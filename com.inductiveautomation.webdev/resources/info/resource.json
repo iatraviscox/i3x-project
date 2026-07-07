@@ -5,8 +5,8 @@
   "overridable": true,
   "files": [
     "config.json",
-    "doPut.py",
     "doTrace.py",
+    "doPut.py",
     "doHead.py",
     "doPatch.py",
     "doPost.py",
@@ -15,10 +15,10 @@
     "doDelete.py"
   ],
   "attributes": {
-    "lastModificationSignature": "3276f3e251e36118d8b7075ece8de92c73d920ae30efba1effed84f59bd56802",
+    "lastModificationSignature": "4ebf779653e29b6e957fe79e369723d4faa1546ac5f71ed56d95581a520a2de7",
     "lastModification": {
       "actor": "admin",
-      "timestamp": "2026-04-15T20:00:49Z"
+      "timestamp": "2026-07-03T19:13:22Z"
     }
   }
 }

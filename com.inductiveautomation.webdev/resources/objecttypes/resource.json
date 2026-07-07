@@ -4,21 +4,21 @@
   "restricted": false,
   "overridable": true,
   "files": [
+    "doTrace.py",
     "config.json",
     "doPut.py",
-    "doTrace.py",
     "doHead.py",
     "doPatch.py",
-    "doPost.py",
     "doOptions.py",
+    "doPost.py",
     "doGet.py",
     "doDelete.py"
   ],
   "attributes": {
-    "lastModificationSignature": "49cf6454b3cf84c47fbc21c3fb2357327c87546177d7284835ae860088843d9e",
+    "lastModificationSignature": "3ee7870de7e846992c2453b0a59d6574a414d16c4f7574d9df1e8c2d2cf2a4f3",
     "lastModification": {
       "actor": "admin",
-      "timestamp": "2026-04-15T02:52:59Z"
+      "timestamp": "2026-07-03T19:13:21Z"
     }
   }
 }

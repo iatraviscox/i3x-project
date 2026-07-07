@@ -1,6 +1,4 @@
 def doGet(request, session):
-	import traceback
-	
 	try:
 		params = request["params"]
 		typeId = params.get("typeElementId", None)
@@ -8,9 +6,6 @@ def doGet(request, session):
 		root = params.get("root", "false").lower() == "true"
 		(errorCode, bulkError, error, result) = i3x.handlers.getObjects(typeId, includeMetadata, root)
 	except:
-		errorCode = 500
-		bulkError = False
-		error = traceback.format_exc()
-		result = None
-		
+		(errorCode, bulkError, error, result) = i3x.handlers.serverError("i3x.objects")
+
 	return i3x.handlers.handleResponse(request, errorCode, False, bulkError, error, result)

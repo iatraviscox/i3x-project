@@ -1,14 +1,9 @@
 def doPost(request, session):
-	import traceback
-	
 	try:
 		requestData = request["postData"]
-		elementIds = requestData.get("elementIds", None)
+		elementIds = requestData.get("elementIds", [])
 		(errorCode, bulkError, error, result) = i3x.handlers.getRelationshipTypes(None, elementIds)
 	except:
-		errorCode = 500
-		bulkError = False
-		error = traceback.format_exc()
-		result = None
-		
+		(errorCode, bulkError, error, result) = i3x.handlers.serverError("i3x.relationshiptypes")
+
 	return i3x.handlers.handleResponse(request, errorCode, True, bulkError, error, result)
