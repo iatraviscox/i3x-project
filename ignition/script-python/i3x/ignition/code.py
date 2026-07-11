@@ -246,6 +246,16 @@ def getUdtInstances():
 		alarms = getAlarms(tagProvider)
 		for alarmTagPath in alarms:
 			alarm = alarms[alarmTagPath]
+			# parseAlarms sets parentPath to the owning *atomic tag*, but an atomic
+			# tag is not an i3X object. Re-parent the alarm to the tag's containing
+			# folder/UDT so we don't materialize the owning tag as a folder (which
+			# would otherwise be expanded by addFolders and leak into that folder's
+			# HasChildren). Alarms on UDT member tags already resolve to the UDT via
+			# findUdtParent; this makes alarms on plain-folder tags behave the same.
+			containerPath = "/".join(alarm["parentPath"].split("/")[:-1])
+			if containerPath == "":
+				containerPath = tpPath
+			alarm["parentPath"] = containerPath
 			udtInstances[alarm["path"]] = alarm
 
 		# UDT instances.
@@ -293,6 +303,15 @@ def getUdtInstances():
 
 			if udtInstance["typeId"] == "ignition-alarm":
 				relationships["AlarmOf"] = parentId
+			elif udtInstance["parentUdt"] != None:
+				# Inside a UDT the model is composition, not containment. Emitting
+				# HasParent here would reverse (HasParent -> HasChildren) into a
+				# HasChildren edge on the UDT, surfacing member UDTs and the
+				# intervening (non-addressable) folders as the UDT's children.
+				# Member UDTs are components of the nearest UDT ancestor; the
+				# intervening folders get no surfaced relationship.
+				if udtInstance["type"] == "udt":
+					relationships["ComponentOf"] = parentId
 			elif parentId != None:
 				relationships["HasParent"] = parentId
 
@@ -303,9 +322,6 @@ def getUdtInstances():
 
 			if len(udtInstance["alarms"]) > 0:
 				relationships["HasAlarm"] = [i3x.utils.pathToElementId(path) for path in udtInstance["alarms"]]
-
-			if udtInstance["type"] == "udt" and udtInstance["parentPath"] != "" and udtInstances[udtInstance["parentPath"]]["type"] == "udt":
-				relationships["ComponentOf"] = i3x.utils.pathToElementId(udtInstance["parentPath"])
 
 			udtInstance["parentId"] = parentId
 			udtInstance["relationships"] = relationships
